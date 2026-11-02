@@ -1,0 +1,6 @@
+{
+  "name": "Nchord",
+  "description": "An artistic, minimalist audio player inspired by Nothing OS with ad-free full-track YouTube Music streaming, per-client Spotify OAuth2 PKCE sync, frosted glass architecture, and synced lyrics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
