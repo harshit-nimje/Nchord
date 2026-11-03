@@ -1,21 +1,35 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Nchord — Production R8 / ProGuard Rules
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Preserve source line numbers for actionable crash stack traces
+-keepattributes SourceFile,LineNumberTable
+-keepattributes Signature,InnerClasses,EnclosingMethod,RuntimeVisibleAnnotations,RuntimeVisibleParameterAnnotations
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Retrofit 2: keep service interfaces and generic parameter/return signatures
+-keep,allowobfuscation,allowshrinking interface retrofit2.Call
+-keep,allowobfuscation,allowshrinking class retrofit2.Response
+-keep,allowobfuscation,allowshrinking class kotlin.coroutines.Continuation
+-keepclassmembers,allowshrinking,allowobfuscation interface * {
+    @retrofit2.http.* <methods>;
+}
+-dontwarn org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement
+-dontwarn javax.annotation.**
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Moshi KSP Codegen: preserve @JsonClass DTOs and generated *JsonAdapter constructors
+-keep class com.squareup.moshi.JsonAdapter
+-keep @com.squareup.moshi.JsonClass class * { *; }
+-keep class **JsonAdapter {
+    public <init>(com.squareup.moshi.Moshi);
+}
+
+# Room Database: preserve @Entity models and generated *_Impl database/DAO classes
+-keep @androidx.room.Entity class * { *; }
+-keep class * extends androidx.room.RoomDatabase {
+    void <init>();
+}
+-keep class com.example.data.local.**_Impl { *; }
+
+# OkHttp 4 / Platform TLS
+-dontwarn okhttp3.internal.platform.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**

@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.data.model.AudioQualityTier
+import com.example.data.model.DisplayRefreshPolicy
 import com.example.data.model.GlyphSettings
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -33,8 +34,13 @@ class NothingPreferencesStore(private val context: Context) {
         val GLYPH_REACTIVE = booleanPreferencesKey("glyph_reactive_leds")
         val AUTOMIX_ENABLED = booleanPreferencesKey("automix_enabled")
         val TACTILE_HAPTICS = booleanPreferencesKey("tactile_haptics")
+        val HIDE_UNPLAYABLE_SONGS = booleanPreferencesKey("hide_unplayable_songs")
+        val DISPLAY_REFRESH_POLICY = stringPreferencesKey("display_refresh_policy")
+        val UNPLAYABLE_TRACK_IDS = stringPreferencesKey("unplayable_track_ids_csv")
+        val HIDDEN_HOME_PLAYLIST_KEYS = stringPreferencesKey("hidden_home_playlist_keys_csv")
 
         val PKCE_VERIFIER = stringPreferencesKey("spotify_pkce_verifier")
+        val PKCE_STATE = stringPreferencesKey("spotify_pkce_state")
         val SPOTIFY_ACCESS_TOKEN = stringPreferencesKey("spotify_access_token")
         val SPOTIFY_REFRESH_TOKEN = stringPreferencesKey("spotify_refresh_token")
         val SPOTIFY_EXPIRES_AT = longPreferencesKey("spotify_expires_at")
@@ -80,8 +86,28 @@ class NothingPreferencesStore(private val context: Context) {
             oledDarkMode = prefs[Keys.OLED_DARK_MODE] ?: true,
             glyphReactiveLeds = prefs[Keys.GLYPH_REACTIVE] ?: true,
             automixEnabled = prefs[Keys.AUTOMIX_ENABLED] ?: true,
-            tactileHaptics = prefs[Keys.TACTILE_HAPTICS] ?: true
+            tactileHaptics = prefs[Keys.TACTILE_HAPTICS] ?: true,
+            hideUnplayableSongs = prefs[Keys.HIDE_UNPLAYABLE_SONGS] ?: false,
+            displayRefreshPolicy = DisplayRefreshPolicy.fromId(prefs[Keys.DISPLAY_REFRESH_POLICY])
         )
+    }
+
+    val unplayableTrackIdsFlow: Flow<Set<String>> = context.nothingDataStore.data.map { prefs ->
+        val raw = prefs[Keys.UNPLAYABLE_TRACK_IDS].orEmpty()
+        if (raw.isBlank()) {
+            emptySet()
+        } else {
+            raw.split('|').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+        }
+    }
+
+    val hiddenHomePlaylistKeysFlow: Flow<Set<String>> = context.nothingDataStore.data.map { prefs ->
+        val raw = prefs[Keys.HIDDEN_HOME_PLAYLIST_KEYS].orEmpty()
+        if (raw.isBlank()) {
+            emptySet()
+        } else {
+            raw.split('|').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+        }
     }
 
     val spotifyAccessTokenFlow: Flow<String?> = context.nothingDataStore.data.map { prefs ->
@@ -147,12 +173,82 @@ class NothingPreferencesStore(private val context: Context) {
         context.nothingDataStore.edit { it[Keys.TACTILE_HAPTICS] = enabled }
     }
 
-    suspend fun savePkceVerifier(verifier: String) {
-        context.nothingDataStore.edit { it[Keys.PKCE_VERIFIER] = verifier }
+    suspend fun setHideUnplayableSongs(enabled: Boolean) {
+        context.nothingDataStore.edit { it[Keys.HIDE_UNPLAYABLE_SONGS] = enabled }
     }
 
-    suspend fun getPkceVerifier(): String? {
-        return context.nothingDataStore.data.first()[Keys.PKCE_VERIFIER]
+    suspend fun setDisplayRefreshPolicy(policy: DisplayRefreshPolicy) {
+        context.nothingDataStore.edit { it[Keys.DISPLAY_REFRESH_POLICY] = policy.id }
+    }
+
+    suspend fun markTrackUnplayable(trackId: String) {
+        val clean = trackId.trim()
+        if (clean.isEmpty()) return
+        context.nothingDataStore.edit { prefs ->
+            val existing = prefs[Keys.UNPLAYABLE_TRACK_IDS]
+                .orEmpty()
+                .split('|')
+                .filter { it.isNotBlank() && it != clean }
+            val updated = (listOf(clean) + existing).take(300)
+            prefs[Keys.UNPLAYABLE_TRACK_IDS] = updated.joinToString("|")
+        }
+    }
+
+    suspend fun clearTrackUnplayable(trackId: String) {
+        val clean = trackId.trim()
+        if (clean.isEmpty()) return
+        context.nothingDataStore.edit { prefs ->
+            val current = prefs[Keys.UNPLAYABLE_TRACK_IDS].orEmpty()
+            if (current.isBlank()) return@edit
+            val filtered = current.split('|').filter { it.isNotBlank() && it != clean }
+            prefs[Keys.UNPLAYABLE_TRACK_IDS] = filtered.joinToString("|")
+        }
+    }
+
+    suspend fun hideHomePlaylistKeys(keys: Collection<String>) {
+        val normalized = keys.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (normalized.isEmpty()) return
+        context.nothingDataStore.edit { prefs ->
+            val existing = prefs[Keys.HIDDEN_HOME_PLAYLIST_KEYS]
+                .orEmpty()
+                .split('|')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && it !in normalized }
+            val updated = (normalized + existing).take(400)
+            prefs[Keys.HIDDEN_HOME_PLAYLIST_KEYS] = updated.joinToString("|")
+        }
+    }
+
+    suspend fun clearHiddenHomePlaylistKeys() {
+        context.nothingDataStore.edit { prefs ->
+            prefs.remove(Keys.HIDDEN_HOME_PLAYLIST_KEYS)
+        }
+    }
+
+    suspend fun savePkceHandshake(verifier: String, state: String) {
+        context.nothingDataStore.edit { prefs ->
+            prefs[Keys.PKCE_VERIFIER] = verifier
+            prefs[Keys.PKCE_STATE] = state
+        }
+    }
+
+    suspend fun consumePkceHandshake(): Pair<String?, String?> {
+        var verifier: String? = null
+        var state: String? = null
+        context.nothingDataStore.edit { prefs ->
+            verifier = prefs[Keys.PKCE_VERIFIER]
+            state = prefs[Keys.PKCE_STATE]
+            prefs.remove(Keys.PKCE_VERIFIER)
+            prefs.remove(Keys.PKCE_STATE)
+        }
+        return verifier to state
+    }
+
+    suspend fun clearPkceHandshake() {
+        context.nothingDataStore.edit { prefs ->
+            prefs.remove(Keys.PKCE_VERIFIER)
+            prefs.remove(Keys.PKCE_STATE)
+        }
     }
 
     suspend fun saveSpotifyTokens(accessToken: String, refreshToken: String?, expiresInSec: Long) {
@@ -181,6 +277,7 @@ class NothingPreferencesStore(private val context: Context) {
             prefs.remove(Keys.SPOTIFY_REFRESH_TOKEN)
             prefs.remove(Keys.SPOTIFY_EXPIRES_AT)
             prefs.remove(Keys.PKCE_VERIFIER)
+            prefs.remove(Keys.PKCE_STATE)
         }
     }
 

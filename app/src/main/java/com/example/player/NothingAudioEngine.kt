@@ -1,24 +1,29 @@
 package com.example.player
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
-import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.util.LruCache
 import androidx.compose.runtime.Immutable
+import androidx.core.net.toUri
 import com.example.data.model.AudioQualityTier
 import com.example.data.model.AudioSourceType
 import com.example.data.model.StreamQualityTelemetry
@@ -34,19 +39,19 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 
 private val IDLE_SPECTRUM = List(12) { 0.08f }
+private val IDLE_SIX_BANDS = List(6) { 0.08f }
 
 @Immutable
 data class AudioEngineState(
@@ -59,6 +64,8 @@ data class AudioEngineState(
     val audioSessionId: Int = 0,
     val streamTelemetry: StreamQualityTelemetry = StreamQualityTelemetry(),
     val glyphSpectrum: List<Float> = IDLE_SPECTRUM,
+    val sixBandSpectrum: List<Float> = IDLE_SIX_BANDS,
+    val isRealtimeFftActive: Boolean = false,
     val errorMessage: String? = null
 )
 
@@ -67,6 +74,10 @@ class NothingAudioEngine(private val context: Context) {
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val artworkCache = LruCache<String, Bitmap>(16)
+    private val localStreamProxy = LocalAudioStreamProxy(NetworkModule.okHttpClient)
+    private val audioVisualizer = NothingAudioVisualizer(context)
+    private val audioManager: AudioManager? =
+        context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
     private var mediaPlayer: MediaPlayer? = null
     private var progressJob: Job? = null
@@ -76,6 +87,51 @@ class NothingAudioEngine(private val context: Context) {
     private var desiredSpeed: Float = 1.0f
     private var currentArtworkBitmap: Bitmap? = null
     private var smoothedBands = FloatArray(12) { 0.08f }
+
+    private var hasAudioFocus: Boolean = false
+    private var resumeOnFocusGain: Boolean = false
+    private var isDucked: Boolean = false
+    private var noisyReceiverRegistered: Boolean = false
+    @Volatile private var pendingSeekTargetMs: Long = -1L
+    @Volatile private var pendingSeekDeadlineElapsedMs: Long = 0L
+
+    private val playbackAudioAttributes: AudioAttributes = AudioAttributes.Builder()
+        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_ALL)
+            }
+        }
+        .build()
+
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        engineScope.launch {
+            handleAudioFocusChange(focusChange)
+        }
+    }
+
+    private val audioFocusRequest: AudioFocusRequest? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(playbackAudioAttributes)
+                .setAcceptsDelayedFocusGain(true)
+                .setWillPauseWhenDucked(false)
+                .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                .build()
+        } else {
+            null
+        }
+
+    private val becomingNoisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                engineScope.launch {
+                    pauseInternal(abandonFocus = true, clearResumeFlag = true)
+                }
+            }
+        }
+    }
 
     var onTrackEnded: (() -> Unit)? = null
     var onSkipPrevious: (() -> Unit)? = null
@@ -234,6 +290,8 @@ class NothingAudioEngine(private val context: Context) {
         qualityTier: AudioQualityTier = AudioQualityTier.LOSSLESS_LDAC
     ) {
         val token = ++activeSessionToken
+        resumeOnFocusGain = false
+        pendingSeekTargetMs = -1L
         releasePlayerOnly()
         smoothedBands = FloatArray(12) { 0.08f }
         loadNotificationArtworkAsync(track, token)
@@ -254,6 +312,8 @@ class NothingAudioEngine(private val context: Context) {
                 outputRoute = queryHardwareOutputRoute()
             ),
             glyphSpectrum = IDLE_SPECTRUM,
+            sixBandSpectrum = IDLE_SIX_BANDS,
+            isRealtimeFftActive = false,
             errorMessage = null
         )
     }
@@ -266,6 +326,7 @@ class NothingAudioEngine(private val context: Context) {
         allowRetryCallback: Boolean = true
     ) {
         val myToken = ++activeSessionToken
+        resumeOnFocusGain = false
         releasePlayerOnly()
 
         val resolvedUrl = resolved.url
@@ -305,18 +366,14 @@ class NothingAudioEngine(private val context: Context) {
             playbackSpeed = desiredSpeed,
             streamTelemetry = telemetry,
             glyphSpectrum = IDLE_SPECTRUM,
+            sixBandSpectrum = IDLE_SIX_BANDS,
+            isRealtimeFftActive = false,
             errorMessage = null
         )
 
         try {
             val mp = MediaPlayer().apply {
-                val attrsBuilder = AudioAttributes.Builder()
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    attrsBuilder.setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_ALL)
-                }
-                setAudioAttributes(attrsBuilder.build())
+                setAudioAttributes(playbackAudioAttributes)
 
                 when {
                     resolvedUrl.startsWith("/") || resolvedUrl.startsWith("file://") -> {
@@ -327,7 +384,7 @@ class NothingAudioEngine(private val context: Context) {
                         }
                     }
                     track.sourceType == AudioSourceType.LOCAL_FILE || resolvedUrl.startsWith("content://") -> {
-                        setDataSource(context, Uri.parse(resolvedUrl))
+                        setDataSource(context, resolvedUrl.toUri())
                     }
                     else -> {
                         val headers = resolved.requestHeaders.ifEmpty {
@@ -335,7 +392,7 @@ class NothingAudioEngine(private val context: Context) {
                                 "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36"
                             )
                         }
-                        setDataSource(context, Uri.parse(resolvedUrl), headers)
+                        setDataSource(context, resolvedUrl.toUri(), headers)
                     }
                 }
 
@@ -347,19 +404,41 @@ class NothingAudioEngine(private val context: Context) {
                     prepareWatchdogJob?.cancel()
                     val actualDur = player.duration.toLong().takeIf { it > 0L } ?: resolved.durationMs
                     applyPlaybackSpeedInternal(player, desiredSpeed)
-                    player.start()
+                    val grantedFocus = requestAudioFocusForPlayback()
                     val activeTrack = track.copy(durationMs = actualDur)
-                    _state.value = _state.value.copy(
-                        currentTrack = activeTrack,
-                        isPlaying = true,
-                        isBuffering = false,
-                        durationMs = actualDur,
-                        audioSessionId = runCatching { player.audioSessionId }.getOrDefault(0),
-                        streamTelemetry = telemetry.copy(outputRoute = queryHardwareOutputRoute(bitPerfectUsb)),
-                        errorMessage = null
-                    )
-                    syncSystemMediaSession(activeTrack, true, 0L, actualDur, publishNotification = true)
-                    startProgressTelemetry()
+                    if (grantedFocus) {
+                        isDucked = false
+                        runCatching { player.setVolume(1.0f, 1.0f) }
+                        player.start()
+                        registerBecomingNoisyReceiver()
+                        val sessionId = runCatching { player.audioSessionId }.getOrDefault(0)
+                        audioVisualizer.attachOrUpdate(sessionId, playing = true)
+                        _state.value = _state.value.copy(
+                            currentTrack = activeTrack,
+                            isPlaying = true,
+                            isBuffering = false,
+                            durationMs = actualDur,
+                            audioSessionId = sessionId,
+                            streamTelemetry = telemetry.copy(outputRoute = queryHardwareOutputRoute(bitPerfectUsb)),
+                            errorMessage = null
+                        )
+                        syncSystemMediaSession(activeTrack, true, 0L, actualDur, publishNotification = true)
+                        startProgressTelemetry()
+                    } else {
+                        // Delayed focus or active call — stay prepared and paused cleanly
+                        resumeOnFocusGain = true
+                        val sessionId = runCatching { player.audioSessionId }.getOrDefault(0)
+                        _state.value = _state.value.copy(
+                            currentTrack = activeTrack,
+                            isPlaying = false,
+                            isBuffering = false,
+                            durationMs = actualDur,
+                            audioSessionId = sessionId,
+                            streamTelemetry = telemetry.copy(outputRoute = queryHardwareOutputRoute(bitPerfectUsb)),
+                            errorMessage = null
+                        )
+                        syncSystemMediaSession(activeTrack, false, 0L, actualDur, publishNotification = true)
+                    }
                 }
 
                 setOnBufferingUpdateListener { _, percent ->
@@ -368,12 +447,24 @@ class NothingAudioEngine(private val context: Context) {
                     }
                 }
 
+                setOnSeekCompleteListener { player ->
+                    if (myToken != activeSessionToken) return@setOnSeekCompleteListener
+                    pendingSeekTargetMs = -1L
+                    val settledPos = runCatching { player.currentPosition.toLong() }
+                        .getOrDefault(_state.value.currentPositionMs)
+                    _state.value = _state.value.copy(currentPositionMs = settledPos)
+                }
+
                 setOnCompletionListener {
                     if (myToken != activeSessionToken) return@setOnCompletionListener
+                    unregisterBecomingNoisyReceiver()
+                    audioVisualizer.pauseCapture()
                     _state.value = _state.value.copy(
                         isPlaying = false,
                         currentPositionMs = _state.value.durationMs,
-                        glyphSpectrum = IDLE_SPECTRUM
+                        glyphSpectrum = IDLE_SPECTRUM,
+                        sixBandSpectrum = IDLE_SIX_BANDS,
+                        isRealtimeFftActive = false
                     )
                     progressJob?.cancel()
                     onTrackEnded?.invoke()
@@ -384,15 +475,15 @@ class NothingAudioEngine(private val context: Context) {
                     Log.e("NothingAudioEngine", "MediaPlayer error what=$what extra=$extra")
                     prepareWatchdogJob?.cancel()
                     progressJob?.cancel()
-                    if (resolvedUrl.startsWith("http", ignoreCase = true)) {
-                        tryOkHttpCachePlaybackFallback(
+                    unregisterBecomingNoisyReceiver()
+                    val isAlreadyLoopback = resolvedUrl.startsWith("http://127.0.0.1:", ignoreCase = true)
+                    if (!isAlreadyLoopback && resolvedUrl.startsWith("http", ignoreCase = true)) {
+                        tryLoopbackProxyPlaybackFallback(
                             myToken = myToken,
                             track = track,
                             resolved = resolved,
                             qualityTier = qualityTier,
-                            bitPerfectUsb = bitPerfectUsb,
-                            telemetry = telemetry,
-                            allowRetryCallback = allowRetryCallback
+                            bitPerfectUsb = bitPerfectUsb
                         )
                     } else if (allowRetryCallback && onStreamError != null) {
                         onStreamError?.invoke(track)
@@ -429,15 +520,14 @@ class NothingAudioEngine(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e("NothingAudioEngine", "Failed starting MediaPlayer", e)
-            if (resolvedUrl.startsWith("http", ignoreCase = true)) {
-                tryOkHttpCachePlaybackFallback(
+            val isAlreadyLoopback = resolvedUrl.startsWith("http://127.0.0.1:", ignoreCase = true)
+            if (!isAlreadyLoopback && resolvedUrl.startsWith("http", ignoreCase = true)) {
+                tryLoopbackProxyPlaybackFallback(
                     myToken = myToken,
                     track = track,
                     resolved = resolved,
                     qualityTier = qualityTier,
-                    bitPerfectUsb = bitPerfectUsb,
-                    telemetry = telemetry,
-                    allowRetryCallback = allowRetryCallback
+                    bitPerfectUsb = bitPerfectUsb
                 )
             } else if (allowRetryCallback && onStreamError != null) {
                 onStreamError?.invoke(track)
@@ -453,64 +543,39 @@ class NothingAudioEngine(private val context: Context) {
 
     /**
      * When Android's native Stagefright HTTP client rejects a valid CDN URL (e.g. TLS cipher,
-     * custom header, or chunked redirect on googlevideo / monochrome), stream via OkHttp into
-     * app cacheDir and play from FileDescriptor before triggering alternate-extractor retry.
+     * custom header, or chunked redirect), route the stream progressively through [localStreamProxy]
+     * on `127.0.0.1` with native HTTP `Range` support instead of blocking on a full-file download.
      */
-    private fun tryOkHttpCachePlaybackFallback(
+    private fun tryLoopbackProxyPlaybackFallback(
         myToken: Long,
         track: TrackItem,
         resolved: ResolvedStreamResult,
         qualityTier: AudioQualityTier,
-        bitPerfectUsb: Boolean,
-        telemetry: StreamQualityTelemetry,
-        allowRetryCallback: Boolean
+        bitPerfectUsb: Boolean
     ) {
+        if (myToken != activeSessionToken) return
         val streamUrl = resolved.url ?: return
-        engineScope.launch {
-            val cachedFile = kotlinx.coroutines.withTimeoutOrNull(6_500L) {
-                withContext(Dispatchers.IO) {
-                    runCatching {
-                        val target = File(context.cacheDir, "nchord_proxy_${myToken % 4}.audio")
-                        val reqBuilder = Request.Builder().url(streamUrl)
-                        val headers = resolved.requestHeaders.ifEmpty {
-                            mapOf(
-                                "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36"
-                            )
-                        }
-                        headers.forEach { (k, v) -> reqBuilder.header(k, v) }
-                        NetworkModule.fastHttpClient.newCall(reqBuilder.build()).execute().use { resp ->
-                            if (!resp.isSuccessful) return@use null
-                            val body = resp.body ?: return@use null
-                            body.byteStream().use { input ->
-                                FileOutputStream(target).use { out ->
-                                    input.copyTo(out, 32 * 1024)
-                                }
-                            }
-                            if (target.exists() && target.length() > 8_192L) target else null
-                        }
-                    }.getOrNull()
-                }
-            }
-
-            if (myToken != activeSessionToken) return@launch
-
-            if (cachedFile != null) {
-                playTrack(
-                    track = track,
-                    resolved = resolved.copy(url = cachedFile.absolutePath),
-                    qualityTier = qualityTier,
-                    bitPerfectUsb = bitPerfectUsb,
-                    allowRetryCallback = allowRetryCallback
-                )
-            } else if (allowRetryCallback && onStreamError != null) {
-                onStreamError?.invoke(track)
-            } else {
-                _state.value = _state.value.copy(
-                    isPlaying = false,
-                    isBuffering = false,
-                    errorMessage = "Unable to buffer stream"
-                )
-            }
+        val proxyUrl = localStreamProxy.registerStream(
+            streamKey = "tok_${myToken}_${track.id.hashCode()}",
+            upstreamUrl = streamUrl,
+            headers = resolved.requestHeaders
+        )
+        if (proxyUrl != null) {
+            playTrack(
+                track = track,
+                resolved = resolved.copy(url = proxyUrl, requestHeaders = emptyMap()),
+                qualityTier = qualityTier,
+                bitPerfectUsb = bitPerfectUsb,
+                allowRetryCallback = true
+            )
+        } else if (onStreamError != null) {
+            onStreamError?.invoke(track)
+        } else {
+            _state.value = _state.value.copy(
+                isPlaying = false,
+                isBuffering = false,
+                errorMessage = "Unable to open local stream relay"
+            )
         }
     }
 
@@ -535,75 +600,216 @@ class NothingAudioEngine(private val context: Context) {
     }
 
     private fun applyPlaybackSpeedInternal(player: MediaPlayer, speed: Float) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && speed != 1.0f) {
+        if (speed != 1.0f) {
             runCatching {
                 player.playbackParams = PlaybackParams().setSpeed(speed)
             }
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && _state.value.playbackSpeed != 1.0f) {
+        } else if (_state.value.playbackSpeed != 1.0f) {
             runCatching {
                 player.playbackParams = PlaybackParams().setSpeed(1.0f)
             }
         }
     }
 
-    fun togglePlayPause(): Boolean {
-        val mp = mediaPlayer ?: return false
-        return try {
+    private fun requestAudioFocusForPlayback(): Boolean {
+        val am = audioManager ?: return true
+        if (hasAudioFocus) return true
+        val req = audioFocusRequest
+        val res = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && req != null) {
+            am.requestAudioFocus(req)
+        } else {
+            @Suppress("DEPRECATION")
+            am.requestAudioFocus(
+                audioFocusChangeListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+        hasAudioFocus = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        return hasAudioFocus
+    }
+
+    private fun abandonAudioFocusInternal() {
+        val am = audioManager ?: return
+        if (!hasAudioFocus && !resumeOnFocusGain) return
+        hasAudioFocus = false
+        val req = audioFocusRequest
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && req != null) {
+            runCatching { am.abandonAudioFocusRequest(req) }
+        } else {
+            @Suppress("DEPRECATION")
+            runCatching { am.abandonAudioFocus(audioFocusChangeListener) }
+        }
+    }
+
+    private fun registerBecomingNoisyReceiver() {
+        if (noisyReceiverRegistered) return
+        try {
+            val filter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(becomingNoisyReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                context.registerReceiver(becomingNoisyReceiver, filter)
+            }
+            noisyReceiverRegistered = true
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unregisterBecomingNoisyReceiver() {
+        if (!noisyReceiverRegistered) return
+        noisyReceiverRegistered = false
+        try {
+            context.unregisterReceiver(becomingNoisyReceiver)
+        } catch (_: IllegalArgumentException) {
+        }
+    }
+
+    private fun pauseInternal(abandonFocus: Boolean, clearResumeFlag: Boolean) {
+        val mp = mediaPlayer ?: return
+        if (clearResumeFlag) {
+            resumeOnFocusGain = false
+        }
+        unregisterBecomingNoisyReceiver()
+        audioVisualizer.pauseCapture()
+        if (abandonFocus) {
+            abandonAudioFocusInternal()
+        }
+        try {
             if (mp.isPlaying) {
                 mp.pause()
-                progressJob?.cancel()
-                val pos = runCatching { mp.currentPosition.toLong() }.getOrDefault(_state.value.currentPositionMs)
-                _state.value = _state.value.copy(
-                    isPlaying = false,
-                    currentPositionMs = pos,
-                    glyphSpectrum = IDLE_SPECTRUM
-                )
-                syncSystemMediaSession(
-                    track = _state.value.currentTrack,
-                    isPlaying = false,
-                    posMs = pos,
-                    durMs = _state.value.durationMs,
-                    publishNotification = true
-                )
-                false
-            } else {
-                mp.start()
-                applyPlaybackSpeedInternal(mp, desiredSpeed)
-                val pos = runCatching { mp.currentPosition.toLong() }.getOrDefault(_state.value.currentPositionMs)
-                _state.value = _state.value.copy(isPlaying = true, currentPositionMs = pos)
-                syncSystemMediaSession(
-                    track = _state.value.currentTrack,
-                    isPlaying = true,
-                    posMs = pos,
-                    durMs = _state.value.durationMs,
-                    publishNotification = true
-                )
-                startProgressTelemetry()
-                true
             }
+            progressJob?.cancel()
+            val pos = runCatching { mp.currentPosition.toLong() }.getOrDefault(_state.value.currentPositionMs)
+            _state.value = _state.value.copy(
+                isPlaying = false,
+                currentPositionMs = pos,
+                glyphSpectrum = IDLE_SPECTRUM,
+                sixBandSpectrum = IDLE_SIX_BANDS,
+                isRealtimeFftActive = false
+            )
+            syncSystemMediaSession(
+                track = _state.value.currentTrack,
+                isPlaying = false,
+                posMs = pos,
+                durMs = _state.value.durationMs,
+                publishNotification = true
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun resumeInternal(): Boolean {
+        val mp = mediaPlayer ?: return false
+        if (!requestAudioFocusForPlayback()) {
+            resumeOnFocusGain = true
+            return false
+        }
+        return try {
+            isDucked = false
+            runCatching { mp.setVolume(1.0f, 1.0f) }
+            mp.start()
+            applyPlaybackSpeedInternal(mp, desiredSpeed)
+            registerBecomingNoisyReceiver()
+            val sessionId = runCatching { mp.audioSessionId }.getOrDefault(_state.value.audioSessionId)
+            audioVisualizer.attachOrUpdate(sessionId, playing = true)
+            val pos = runCatching { mp.currentPosition.toLong() }.getOrDefault(_state.value.currentPositionMs)
+            _state.value = _state.value.copy(
+                isPlaying = true,
+                currentPositionMs = pos,
+                audioSessionId = sessionId
+            )
+            syncSystemMediaSession(
+                track = _state.value.currentTrack,
+                isPlaying = true,
+                posMs = pos,
+                durMs = _state.value.durationMs,
+                publishNotification = true
+            )
+            startProgressTelemetry()
+            true
         } catch (_: Exception) {
             false
         }
     }
 
+    private fun handleAudioFocusChange(focusChange: Int) {
+        val mp = mediaPlayer ?: return
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                hasAudioFocus = false
+                pauseInternal(abandonFocus = true, clearResumeFlag = true)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                hasAudioFocus = false
+                val wasPlaying = _state.value.isPlaying || runCatching { mp.isPlaying }.getOrDefault(false)
+                if (wasPlaying) {
+                    resumeOnFocusGain = true
+                    pauseInternal(abandonFocus = false, clearResumeFlag = false)
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                if (_state.value.isPlaying) {
+                    isDucked = true
+                    runCatching { mp.setVolume(0.22f, 0.22f) }
+                }
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasAudioFocus = true
+                if (isDucked) {
+                    isDucked = false
+                    runCatching { mp.setVolume(1.0f, 1.0f) }
+                }
+                if (resumeOnFocusGain && !_state.value.isPlaying) {
+                    resumeOnFocusGain = false
+                    resumeInternal()
+                }
+            }
+        }
+    }
+
+    fun togglePlayPause(): Boolean {
+        val mp = mediaPlayer ?: return false
+        val currentlyPlaying = runCatching { mp.isPlaying }.getOrDefault(_state.value.isPlaying)
+        return if (currentlyPlaying) {
+            pauseInternal(abandonFocus = true, clearResumeFlag = true)
+            false
+        } else {
+            resumeOnFocusGain = false
+            resumeInternal()
+        }
+    }
+
+    fun refreshVisualizerAttachment() {
+        val mp = mediaPlayer ?: return
+        if (_state.value.isPlaying) {
+            val sessionId = runCatching { mp.audioSessionId }.getOrDefault(_state.value.audioSessionId)
+            audioVisualizer.attachOrUpdate(sessionId, playing = true)
+        }
+    }
+
     fun seekTo(positionMs: Long) {
+        val dur = _state.value.durationMs.coerceAtLeast(1L)
+        val target = positionMs.coerceIn(0L, dur)
+        pendingSeekTargetMs = target
+        pendingSeekDeadlineElapsedMs = SystemClock.elapsedRealtime() + 1_100L
+        _state.value = _state.value.copy(currentPositionMs = target)
         val mp = mediaPlayer ?: return
         try {
-            val target = positionMs.coerceIn(0L, _state.value.durationMs.coerceAtLeast(1L))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 mp.seekTo(target, MediaPlayer.SEEK_CLOSEST_SYNC)
             } else {
                 mp.seekTo(target.toInt())
             }
-            _state.value = _state.value.copy(currentPositionMs = target)
             syncSystemMediaSession(
                 track = _state.value.currentTrack,
                 isPlaying = _state.value.isPlaying,
                 posMs = target,
-                durMs = _state.value.durationMs,
+                durMs = dur,
                 publishNotification = false
             )
         } catch (_: Exception) {
+            pendingSeekTargetMs = -1L
         }
     }
 
@@ -614,12 +820,13 @@ class NothingAudioEngine(private val context: Context) {
             val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             when {
                 outputs.any {
-                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && it.type == AudioDeviceInfo.TYPE_USB_HEADSET) ||
                         it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
                         it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
                 } -> {
                     val usbName = outputs.firstOrNull {
-                        it.type == AudioDeviceInfo.TYPE_USB_HEADSET || it.type == AudioDeviceInfo.TYPE_USB_DEVICE
+                        (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && it.type == AudioDeviceInfo.TYPE_USB_HEADSET) ||
+                            it.type == AudioDeviceInfo.TYPE_USB_DEVICE
                     }?.productName?.toString()?.takeIf { it.isNotBlank() }
                     if (bitPerfectUsb) "${usbName ?: "USB DAC"} • Bit-Perfect" else (usbName ?: "USB Audio")
                 }
@@ -642,52 +849,101 @@ class NothingAudioEngine(private val context: Context) {
     }
 
     /**
-     * Synthesizes an organic, track-tempo-locked 12-band musical spectrum (sub-bass kick transient,
-     * warm bassline, harmonic vocal mids, and crisp hi-hat treble shimmer) smoothed with asymmetric
-     * attack/release envelopes so audio-reactive particles & Glyph bars feel alive without jank.
+     * Synthesizes a high-contrast, song-tempo-locked 12-band musical spectrum when hardware
+     * Visualizer PCM tap is unavailable. Uses deterministic track BPM + arrangement phrasing +
+     * sharp exponential kick/snare/hat envelopes so inter-beat valleys drop cleanly to ~0.07f
+     * while beat hits punch up to ~0.97f in lockstep with the song timeline.
      */
-    private fun computeOrganicMusicalSpectrum(posMs: Long, trackSeed: Int): List<Float> {
-        val bpm = 94f + (abs(trackSeed) % 38) // 94..131 BPM seeded deterministically per track
-        val beatPeriodSec = 60f / bpm
+    private fun computeOrganicMusicalSpectrum(
+        posMs: Long,
+        trackSeed: Int,
+        titleHint: String = "",
+        durationMs: Long = 210_000L
+    ): List<Float> {
+        val lower = titleHint.lowercase()
+        val baseBpm = when {
+            lower.contains("slow") || lower.contains("acoustic") || lower.contains("nocturn") ||
+                lower.contains("lullaby") || lower.contains("ballad") -> 84f + (abs(trackSeed) % 14)
+            lower.contains("club") || lower.contains("techno") || lower.contains("house") ||
+                lower.contains("synth") || lower.contains("dance") || lower.contains("upbeat") -> 120f + (abs(trackSeed) % 18)
+            else -> 92f + (abs(trackSeed) % 40) // 92..131 BPM seeded deterministically per track
+        }
+        val beatPeriodSec = 60f / baseBpm
         val timeSec = posMs / 1000f
-        val beatPos = (timeSec / beatPeriodSec)
-        val beatFrac = beatPos - kotlin.math.floor(beatPos)
-        val barBeat = kotlin.math.floor(beatPos).toInt() and 3
+        val beatPos = timeSec / beatPeriodSec
+        val beatIndex = kotlin.math.floor(beatPos).toInt()
+        val beatFrac = (beatPos - kotlin.math.floor(beatPos)).coerceIn(0f, 1f)
+        val barBeat = beatIndex and 3
+        val barNumber = (beatIndex shr 2)
 
-        // Kick transient: fast attack, smooth exponential decay on beats 0, 2 and syncopated 16th
-        val kickAccent = if (barBeat == 0 || barBeat == 2) 1.0f else 0.72f
-        val kickEnvelope = (exp(-beatFrac * 5.8f) * kickAccent).coerceIn(0f, 1f)
+        // Syncopated 8th/16th ghost kick (gives hip-hop / electronic / indie groove depending on trackSeed)
+        val grooveStyle = abs(trackSeed shr 3) and 3
+        val subBeatPos = beatPos * 2f
+        val eighthFrac = (subBeatPos - kotlin.math.floor(subBeatPos)).coerceIn(0f, 1f)
+        val syncopatedGhost = when (grooveStyle) {
+            1 -> if (barBeat == 1 && beatFrac >= 0.5f) exp(-eighthFrac * 7.2f) * 0.78f else 0f
+            2 -> if (barBeat == 2 && beatFrac >= 0.5f) exp(-eighthFrac * 6.8f) * 0.82f else 0f
+            3 -> if (beatFrac >= 0.75f && barBeat == 3) exp(-((beatFrac - 0.75f) * 4f) * 8f) * 0.74f else 0f
+            else -> 0f
+        }
 
-        // Snare / clap transient on backbeats 1 & 3
-        val snareAccent = if (barBeat == 1 || barBeat == 3) 0.92f else 0.25f
-        val snareEnvelope = (exp(-beatFrac * 7.5f) * snareAccent).coerceIn(0f, 1f)
+        // Sharp kick transient: punches hard on downbeats, decays fast so dots breathe between hits
+        val kickAccent = when (barBeat) {
+            0 -> 1.00f
+            2 -> if (grooveStyle == 1) 0.65f else 0.92f
+            else -> if (grooveStyle == 0) 0.80f else 0.30f
+        }
+        val kickEnvelope = maxOf(exp(-beatFrac * 8.4f) * kickAccent, syncopatedGhost).coerceIn(0f, 1f)
 
-        // Phrase swell (8-bar breathing contour so it never feels monotonous or robotic)
-        val phraseSwell = 0.72f + 0.28f * sin(timeSec * 0.42f + (trackSeed and 15) * 0.4f)
+        // Crisp snare / clap transient on backbeats 1 & 3
+        val snareAccent = if (barBeat == 1 || barBeat == 3) 0.96f else 0.14f
+        val snareEnvelope = (exp(-beatFrac * 10.5f) * snareAccent).coerceIn(0f, 1f)
+
+        // 16th-note hi-hat / ride groove pulse
+        val sixteenthPos = beatPos * 4f
+        val sixteenthIdx = kotlin.math.floor(sixteenthPos).toInt() and 3
+        val sixteenthFrac = (sixteenthPos - kotlin.math.floor(sixteenthPos)).coerceIn(0f, 1f)
+        val hatAccent = when (sixteenthIdx) {
+            2 -> 0.88f
+            0 -> 0.54f
+            else -> 0.34f
+        }
+        val hatEnvelope = (exp(-sixteenthFrac * 9.2f) * hatAccent).coerceIn(0f, 1f)
+
+        // Song arrangement contour (intro -> verse -> chorus lift -> bridge breath -> outro)
+        val songRatio = if (durationMs > 15_000L) (posMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0.35f
+        val sectionEnergy = when {
+            songRatio < 0.07f -> 0.52f + (songRatio / 0.07f) * 0.38f
+            songRatio in 0.56f..0.68f -> 0.62f + 0.18f * sin((songRatio - 0.56f) * 26f)
+            songRatio > 0.93f -> (1f - (songRatio - 0.93f) * 8f).coerceIn(0.35f, 1f)
+            (barNumber and 7) in 4..7 -> 1.00f
+            else -> 0.80f
+        }
 
         return List(12) { band ->
-            val normBand = band / 11f // 0 = sub-bass, 0.5 = vocal mids, 1.0 = air/treble
-            val subWeight = (1f - normBand * 2.1f).coerceIn(0f, 1f)
-            val midWeight = (1f - abs(normBand - 0.46f) * 2.4f).coerceIn(0f, 1f)
-            val highWeight = ((normBand - 0.45f) * 1.82f).coerceIn(0f, 1f)
+            val normBand = band / 11f
+            val subWeight = (1f - normBand * 2.15f).coerceIn(0f, 1f)
+            val midWeight = (1f - abs(normBand - 0.46f) * 2.35f).coerceIn(0f, 1f)
+            val highWeight = ((normBand - 0.44f) * 1.78f).coerceIn(0f, 1f)
 
-            val subEnergy = kickEnvelope * 0.78f + (0.20f * (0.5f + 0.5f * sin(timeSec * 3.1f + band * 0.3f)))
-            val midHarmonic = 0.38f +
-                0.34f * (0.5f + 0.5f * sin(timeSec * 4.7f + band * 0.85f + (trackSeed and 7))) +
-                snareEnvelope * 0.32f
-            val highShimmer = 0.22f +
-                0.36f * (0.5f + 0.5f * cos(timeSec * 9.4f + band * 1.35f)).pow(2) +
-                snareEnvelope * 0.28f
+            val bassGroove = 0.08f + kickEnvelope * 0.90f +
+                0.14f * (0.5f + 0.5f * sin(beatPos * 3.14159f + band * 0.4f))
+            val vocalChordSwell = 0.09f +
+                snareEnvelope * 0.58f +
+                0.32f * (0.5f + 0.5f * sin(beatPos * 1.5708f + band * 0.75f + (trackSeed and 7))).pow(2)
+            val highShimmer = 0.06f +
+                hatEnvelope * 0.62f +
+                snareEnvelope * 0.34f
 
-            val rawTarget = ((subWeight * subEnergy + midWeight * midHarmonic + highWeight * highShimmer) * phraseSwell)
-                .coerceIn(0.08f, 0.98f)
+            val rawTarget = (
+                (subWeight * bassGroove + midWeight * vocalChordSwell + highWeight * highShimmer) * sectionEnergy
+                ).coerceIn(0.06f, 0.98f)
 
-            // Asymmetric attack / release smoothing for buttery motion
             val prev = smoothedBands[band]
-            val coeff = if (rawTarget > prev) 0.52f else 0.24f
+            val coeff = if (rawTarget > prev) 0.74f else 0.30f
             val next = prev + (rawTarget - prev) * coeff
             smoothedBands[band] = next
-            next.coerceIn(0.08f, 0.98f)
+            next.coerceIn(0.06f, 0.98f)
         }
     }
 
@@ -698,22 +954,65 @@ class NothingAudioEngine(private val context: Context) {
             while (isActive) {
                 val mp = mediaPlayer
                 if (mp != null && _state.value.isPlaying) {
-                    val pos = runCatching { mp.currentPosition.toLong() }.getOrDefault(0L)
+                    val rawPos = runCatching { mp.currentPosition.toLong() }.getOrDefault(0L)
+                    val seekTarget = pendingSeekTargetMs
+                    val pos = if (seekTarget >= 0L && SystemClock.elapsedRealtime() < pendingSeekDeadlineElapsedMs) {
+                        if (abs(rawPos - seekTarget) <= 750L) {
+                            pendingSeekTargetMs = -1L
+                            rawPos
+                        } else {
+                            seekTarget
+                        }
+                    } else {
+                        if (seekTarget >= 0L) pendingSeekTargetMs = -1L
+                        rawPos
+                    }
                     val dur = runCatching { mp.duration.toLong() }
                         .getOrDefault(_state.value.durationMs)
                         .takeIf { it > 0L } ?: _state.value.durationMs
 
-                    val trackSeed = _state.value.currentTrack?.id?.hashCode() ?: 17
-                    val spectrum = computeOrganicMusicalSpectrum(pos, trackSeed)
+                    val liveFft = audioVisualizer.readLiveSpectraIfActive()
+                    val sixBands: List<Float>
+                    val twelveBars: List<Float>
+                    val realtimeActive: Boolean
+                    if (liveFft != null) {
+                        sixBands = liveFft.first
+                        twelveBars = liveFft.second
+                        realtimeActive = true
+                    } else {
+                        val activeTrack = _state.value.currentTrack
+                        val trackSeed = if (activeTrack != null) {
+                            (activeTrack.id.hashCode() * 31) xor activeTrack.title.hashCode()
+                        } else {
+                            17
+                        }
+                        twelveBars = computeOrganicMusicalSpectrum(
+                            posMs = pos,
+                            trackSeed = trackSeed,
+                            titleHint = "${activeTrack?.title.orEmpty()} ${activeTrack?.album.orEmpty()}",
+                            durationMs = dur
+                        )
+                        sixBands = listOf(
+                            (twelveBars[0] * 0.65f + twelveBars[1] * 0.35f), // Sub-bass
+                            (twelveBars[2] * 0.55f + twelveBars[3] * 0.45f), // Bass
+                            (twelveBars[4] * 0.55f + twelveBars[5] * 0.45f), // Low mids
+                            (twelveBars[6] * 0.55f + twelveBars[7] * 0.45f), // Midrange
+                            (twelveBars[8] * 0.55f + twelveBars[9] * 0.45f), // Upper mids
+                            (twelveBars[10] * 0.45f + twelveBars[11] * 0.55f) // Treble
+                        )
+                        realtimeActive = false
+                    }
 
                     _state.value = _state.value.copy(
                         currentPositionMs = pos,
                         durationMs = dur,
-                        glyphSpectrum = spectrum
+                        glyphSpectrum = twelveBars,
+                        sixBandSpectrum = sixBands,
+                        isRealtimeFftActive = realtimeActive
                     )
 
                     sessionSyncCounter++
-                    if (sessionSyncCounter >= 15) {
+                    if (sessionSyncCounter >= 22) {
                         sessionSyncCounter = 0
                         syncSystemMediaSession(
                             track = _state.value.currentTrack,
@@ -724,7 +1023,7 @@ class NothingAudioEngine(private val context: Context) {
                         )
                     }
                 }
-                delay(66L)
+                delay(46L)
             }
         }
     }
@@ -771,6 +1070,8 @@ class NothingAudioEngine(private val context: Context) {
     private fun releasePlayerOnly() {
         prepareWatchdogJob?.cancel()
         progressJob?.cancel()
+        unregisterBecomingNoisyReceiver()
+        audioVisualizer.detachSession()
         val old = mediaPlayer
         mediaPlayer = null
         if (old != null) {
@@ -783,12 +1084,31 @@ class NothingAudioEngine(private val context: Context) {
 
     fun release() {
         activeSessionToken++
+        resumeOnFocusGain = false
         artworkLoadJob?.cancel()
-        releasePlayerOnly()
+        prepareWatchdogJob?.cancel()
+        progressJob?.cancel()
+        unregisterBecomingNoisyReceiver()
+        abandonAudioFocusInternal()
+        audioVisualizer.release()
+        localStreamProxy.close()
+        val old = mediaPlayer
+        mediaPlayer = null
+        if (old != null) {
+            Thread {
+                runCatching { old.reset() }
+                runCatching { old.release() }
+            }.start()
+        }
+        if (NothingMediaPlaybackService.actionHandler != null) {
+            NothingMediaPlaybackService.actionHandler = null
+        }
         NothingMediaPlaybackService.dismiss(context)
         runCatching {
             mediaSession?.isActive = false
             mediaSession?.release()
         }
+        engineScope.cancel()
+        cleanupScope.cancel()
     }
 }

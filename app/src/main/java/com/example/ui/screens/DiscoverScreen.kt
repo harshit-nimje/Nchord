@@ -29,11 +29,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.GraphicEq
@@ -42,20 +46,28 @@ import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.RemoveCircleOutline
 import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -76,16 +88,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import coil.size.Precision
 import com.example.R
 import com.example.data.model.HomeFeedFilter
 import com.example.data.model.RecentGridTile
 import com.example.data.model.RecentTileKind
 import com.example.data.model.SuggestedPlaylist
 import com.example.data.model.TrackItem
+import com.example.domain.TasteAndSearchRankingEngine
+import com.example.domain.UserTasteProfile
 import com.example.ui.DEFAULT_MOOD_CHANNELS
 import com.example.ui.MoodChannel
 import com.example.ui.NothingUiState
 import com.example.ui.components.NothingPlaylistMosaicCover
+import com.example.ui.components.NothingSlowMarqueeText
 import com.example.ui.components.NothingTrackRow
 import com.example.ui.theme.MonoFontFamily
 
@@ -99,11 +115,19 @@ fun DiscoverScreen(
     currentTrackId: String?,
     isPlaying: Boolean,
     savedIds: Set<String>,
+    unplayableTrackIds: Set<String> = emptySet(),
+    hideUnplayableSongs: Boolean = false,
+    hiddenPlaylistKeys: Set<String> = emptySet(),
+    tasteProfile: UserTasteProfile = UserTasteProfile(),
     onSelectHomeFilter: (HomeFeedFilter) -> Unit,
     onSelectMood: (MoodChannel) -> Unit,
     onOpenRecentTile: (RecentGridTile) -> Unit,
     onOpenCarouselPlaylist: (SuggestedPlaylist) -> Unit,
     onPlayCarouselPlaylist: (SuggestedPlaylist, Boolean) -> Unit,
+    onRemoveRecentTileFromHome: (RecentGridTile) -> Unit = {},
+    onDeleteRecentTilePlaylist: (RecentGridTile) -> Unit = {},
+    onRemoveCarouselPlaylistFromHome: (SuggestedPlaylist) -> Unit = {},
+    onDeleteCarouselPlaylist: (SuggestedPlaylist) -> Unit = {},
     onOpenAlbumForTrack: (TrackItem) -> Unit,
     onPlayTrack: (TrackItem, List<TrackItem>) -> Unit,
     onToggleSave: (TrackItem) -> Unit,
@@ -113,9 +137,25 @@ fun DiscoverScreen(
     modifier: Modifier = Modifier
 ) {
     val activeFilter = uiState.homeFeedFilter
+    var managedRecentTile by remember { mutableStateOf<RecentGridTile?>(null) }
+    var managedCarouselPlaylist by remember { mutableStateOf<SuggestedPlaylist?>(null) }
 
-    val nchordMixes = remember(uiState.suggestedPlaylists, uiState.featuredTracks, uiState.activeMoodLabel) {
-        if (uiState.suggestedPlaylists.isNotEmpty()) {
+    val visibleRecentTiles = remember(recentGridTiles, hiddenPlaylistKeys) {
+        if (hiddenPlaylistKeys.isEmpty()) {
+            recentGridTiles
+        } else {
+            recentGridTiles.filterNot { tile -> isRecentTileHidden(tile, hiddenPlaylistKeys) }
+        }
+    }
+
+    val nchordMixes = remember(
+        uiState.suggestedPlaylists,
+        uiState.featuredTracks,
+        uiState.activeMoodLabel,
+        uiState.selectedMoodId,
+        hiddenPlaylistKeys
+    ) {
+        val raw = if (uiState.suggestedPlaylists.isNotEmpty()) {
             uiState.suggestedPlaylists
         } else if (uiState.featuredTracks.isNotEmpty()) {
             uiState.featuredTracks.chunked(4).mapIndexed { index, chunk ->
@@ -134,12 +174,121 @@ fun DiscoverScreen(
         } else {
             emptyList()
         }
+        raw.filterNot { isSuggestedPlaylistHidden(it, hiddenPlaylistKeys) }
     }
 
-    val pickedSpotlightTrack = remember(uiState.featuredTracks, uiState.moodTracks, offlineTracks, activeFilter) {
+    val visibleSpotifyCrates = remember(uiState.spotifyCratePlaylists, hiddenPlaylistKeys) {
+        uiState.spotifyCratePlaylists.filterNot { isSuggestedPlaylistHidden(it, hiddenPlaylistKeys) }
+    }
+    val visibleYtmSessions = remember(uiState.ytmSessionPlaylists, hiddenPlaylistKeys) {
+        uiState.ytmSessionPlaylists.filterNot { isSuggestedPlaylistHidden(it, hiddenPlaylistKeys) }
+    }
+    val visibleVinylPressings = remember(uiState.vinylPressingPlaylists, hiddenPlaylistKeys) {
+        uiState.vinylPressingPlaylists.filterNot { isSuggestedPlaylistHidden(it, hiddenPlaylistKeys) }
+    }
+
+    managedRecentTile?.let { targetTile ->
+        val canDelete = targetTile.kind == RecentTileKind.USER_PLAYLIST ||
+            targetTile.kind == RecentTileKind.SPOTIFY_PLAYLIST ||
+            targetTile.kind == RecentTileKind.CURATED_PLAYLIST
+        HomePlaylistManageSheet(
+            title = targetTile.title,
+            subtitle = when (targetTile.kind) {
+                RecentTileKind.USER_PLAYLIST -> "Personal Playlist • Library & Home"
+                RecentTileKind.SPOTIFY_PLAYLIST -> "Spotify Crate • Home Shelf"
+                RecentTileKind.CURATED_PLAYLIST -> "Curated Mix • Home Shelf"
+                else -> "Pinned Shortcut • Home Grid"
+            },
+            badge = targetTile.kind.name.replace('_', ' '),
+            canShuffle = false,
+            canDeletePermanently = canDelete,
+            onDismiss = { managedRecentTile = null },
+            onPlayNow = {
+                managedRecentTile = null
+                onOpenRecentTile(targetTile)
+            },
+            onShufflePlay = {},
+            onRemoveFromHome = {
+                managedRecentTile = null
+                onRemoveRecentTileFromHome(targetTile)
+            },
+            onDeletePlaylist = {
+                managedRecentTile = null
+                onDeleteRecentTilePlaylist(targetTile)
+            }
+        )
+    }
+
+    managedCarouselPlaylist?.let { targetPl ->
+        HomePlaylistManageSheet(
+            title = targetPl.title,
+            subtitle = targetPl.subtitle.ifBlank { "${targetPl.trackCount} tracks" },
+            badge = targetPl.badge.ifBlank { "PLAYLIST" },
+            canShuffle = true,
+            canDeletePermanently = true,
+            onDismiss = { managedCarouselPlaylist = null },
+            onPlayNow = {
+                managedCarouselPlaylist = null
+                onPlayCarouselPlaylist(targetPl, false)
+            },
+            onShufflePlay = {
+                managedCarouselPlaylist = null
+                onPlayCarouselPlaylist(targetPl, true)
+            },
+            onRemoveFromHome = {
+                managedCarouselPlaylist = null
+                onRemoveCarouselPlaylistFromHome(targetPl)
+            },
+            onDeletePlaylist = {
+                managedCarouselPlaylist = null
+                onDeleteCarouselPlaylist(targetPl)
+            }
+        )
+    }
+
+    val pickedSpotlightTrack = remember(
+        uiState.featuredTracks,
+        uiState.moodTracks,
+        offlineTracks,
+        activeFilter,
+        unplayableTrackIds,
+        downloadedTrackIds,
+        hideUnplayableSongs,
+        tasteProfile
+    ) {
         when (activeFilter) {
             HomeFeedFilter.OFFLINE -> offlineTracks.firstOrNull()
-            else -> uiState.featuredTracks.firstOrNull() ?: uiState.moodTracks.firstOrNull()
+            else -> {
+                val combined = uiState.featuredTracks + uiState.moodTracks
+                val ranked = TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                    tracks = combined,
+                    profile = tasteProfile,
+                    unplayableIds = unplayableTrackIds
+                )
+                val playableFirst = ranked.firstOrNull { tr ->
+                    (tr.isPlayable && tr.id !in unplayableTrackIds) ||
+                        tr.id in downloadedTrackIds ||
+                        tr.isDownloaded
+                }
+                playableFirst ?: if (hideUnplayableSongs) null else ranked.firstOrNull()
+            }
+        }
+    }
+
+    val visibleMoodTracks = remember(
+        uiState.moodTracks,
+        unplayableTrackIds,
+        downloadedTrackIds,
+        hideUnplayableSongs
+    ) {
+        if (!hideUnplayableSongs) {
+            uiState.moodTracks
+        } else {
+            uiState.moodTracks.filter { track ->
+                (track.isPlayable && track.id !in unplayableTrackIds) ||
+                    track.id in downloadedTrackIds ||
+                    track.isDownloaded
+            }
         }
     }
 
@@ -151,13 +300,17 @@ fun DiscoverScreen(
         verticalArrangement = Arrangement.spacedBy(24.dp)
     ) {
         // 1. Minimal Collector Filter Strip (All • Playlists • Spotify • YouTube • Offline) + Genre Pills
-        item(key = "home_collector_filter_bar") {
+        item(key = "home_collector_filter_bar", contentType = "home_filter_bar") {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 20.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(HomeFeedFilter.entries, key = { it.name }) { filter ->
+                    items(
+                        items = HomeFeedFilter.entries,
+                        key = { it.name },
+                        contentType = { "home_filter_pill" }
+                    ) { filter ->
                         val selected = filter == activeFilter
                         val bg by animateColorAsState(
                             targetValue = if (selected) {
@@ -208,7 +361,11 @@ fun DiscoverScreen(
                         contentPadding = PaddingValues(horizontal = 20.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(DEFAULT_MOOD_CHANNELS, key = { it.id }) { channel ->
+                        items(
+                            items = DEFAULT_MOOD_CHANNELS,
+                            key = { it.id },
+                            contentType = { "mood_chip" }
+                        ) { channel ->
                             val selected = channel.id == uiState.selectedMoodId
                             Box(
                                 modifier = Modifier
@@ -266,11 +423,16 @@ fun DiscoverScreen(
         }
 
         // 2. Top 2-Column × (2–4 Row) Recently Played Playlists Grid (replaces big container)
-        if (recentGridTiles.isNotEmpty()) {
-            item(key = "home_recent_playlists_grid") {
+        if (visibleRecentTiles.isNotEmpty()) {
+            item(key = "home_recent_playlists_grid", contentType = "recent_grid") {
                 RecentPlaylistsCompactGrid(
-                    tiles = recentGridTiles,
+                    tiles = visibleRecentTiles,
                     onClickTile = onOpenRecentTile,
+                    onLongPressTile = { tile ->
+                        if (tile.kind != RecentTileKind.LIKED_SONGS) {
+                            managedRecentTile = tile
+                        }
+                    },
                     modifier = Modifier.padding(horizontal = 20.dp)
                 )
             }
@@ -278,14 +440,14 @@ fun DiscoverScreen(
 
         // 3. Offline Filter Dedicated View
         if (activeFilter == HomeFeedFilter.OFFLINE) {
-            item(key = "offline_vault_header") {
+            item(key = "offline_vault_header", contentType = "section_header") {
                 SectionShelfHeader(
                     title = "Offline Vinyl Vault",
                     tag = "${offlineTracks.size} IN-APP"
                 )
             }
             if (offlineTracks.isEmpty()) {
-                item(key = "offline_empty_state") {
+                item(key = "offline_empty_state", contentType = "empty_state") {
                     Text(
                         text = stringResource(R.string.lib_empty_downloads),
                         style = MaterialTheme.typography.bodyMedium,
@@ -294,7 +456,11 @@ fun DiscoverScreen(
                     )
                 }
             } else {
-                items(offlineTracks, key = { "home_dl_${it.id}" }) { track ->
+                items(
+                    items = offlineTracks,
+                    key = { "home_dl_${it.id}" },
+                    contentType = { "track_row" }
+                ) { track ->
                     NothingTrackRow(
                         track = track,
                         isCurrentTrack = track.id == currentTrackId,
@@ -315,7 +481,7 @@ fun DiscoverScreen(
 
         // 4. "Picked for you" Collector Spotlight Card (Spotify Reference + Nothing Vinyl Language)
         if (pickedSpotlightTrack != null) {
-            item(key = "picked_for_you_spotlight") {
+            item(key = "picked_for_you_spotlight", contentType = "picked_spotlight") {
                 PickedForYouVinylCard(
                     track = pickedSpotlightTrack,
                     isSaved = pickedSpotlightTrack.id in savedIds,
@@ -388,71 +554,78 @@ fun DiscoverScreen(
             activeFilter == HomeFeedFilter.YOUTUBE
 
         if (showNchord && nchordMixes.isNotEmpty()) {
-            item(key = "carousel_nchord_soundtrack") {
+            item(key = "carousel_nchord_soundtrack", contentType = "playlist_carousel") {
                 SquarePlaylistCarouselSection(
                     title = stringResource(R.string.section_soundtrack),
                     tag = "NCHORD ENGINE",
                     playlists = nchordMixes,
                     onOpenPlaylist = onOpenCarouselPlaylist,
-                    onQuickPlayPlaylist = { pl -> onPlayCarouselPlaylist(pl, false) }
+                    onManagePlaylist = { pl -> managedCarouselPlaylist = pl }
                 )
             }
         }
 
-        if (showSpotify && uiState.spotifyCratePlaylists.isNotEmpty()) {
-            item(key = "carousel_spotify_crates") {
+        if (showSpotify && visibleSpotifyCrates.isNotEmpty()) {
+            item(key = "carousel_spotify_crates", contentType = "playlist_carousel") {
                 SquarePlaylistCarouselSection(
                     title = stringResource(R.string.section_spotify_crates),
                     tag = if (uiState.spotifyProfile.isConnected) "SPOTIFY SYNCED" else "SPOTIFY CURATED",
-                    playlists = uiState.spotifyCratePlaylists,
+                    playlists = visibleSpotifyCrates,
                     onOpenPlaylist = onOpenCarouselPlaylist,
-                    onQuickPlayPlaylist = { pl -> onPlayCarouselPlaylist(pl, false) }
+                    onManagePlaylist = { pl -> managedCarouselPlaylist = pl }
                 )
             }
         }
 
-        if (showYoutube && uiState.ytmSessionPlaylists.isNotEmpty()) {
-            item(key = "carousel_ytm_sessions") {
+        if (showYoutube && visibleYtmSessions.isNotEmpty()) {
+            item(key = "carousel_ytm_sessions", contentType = "playlist_carousel") {
                 SquarePlaylistCarouselSection(
                     title = stringResource(R.string.section_ytm_sessions),
                     tag = "YOUTUBE MUSIC",
-                    playlists = uiState.ytmSessionPlaylists,
+                    playlists = visibleYtmSessions,
                     onOpenPlaylist = onOpenCarouselPlaylist,
-                    onQuickPlayPlaylist = { pl -> onPlayCarouselPlaylist(pl, false) }
+                    onManagePlaylist = { pl -> managedCarouselPlaylist = pl }
                 )
             }
         }
 
-        if (showNchord && uiState.vinylPressingPlaylists.isNotEmpty()) {
-            item(key = "carousel_vinyl_pressings") {
+        if (showNchord && visibleVinylPressings.isNotEmpty()) {
+            item(key = "carousel_vinyl_pressings", contentType = "playlist_carousel") {
                 SquarePlaylistCarouselSection(
                     title = stringResource(R.string.section_vinyl_pressings),
                     tag = "33⅓ RPM SLEEVES",
-                    playlists = uiState.vinylPressingPlaylists,
+                    playlists = visibleVinylPressings,
                     onOpenPlaylist = onOpenCarouselPlaylist,
-                    onQuickPlayPlaylist = { pl -> onPlayCarouselPlaylist(pl, false) }
+                    onManagePlaylist = { pl -> managedCarouselPlaylist = pl }
                 )
             }
         }
 
         // 7. Concise Needle-Drop Track Selection at Bottom of Collector Shelf
-        if (activeFilter == HomeFeedFilter.ALL && uiState.moodTracks.isNotEmpty()) {
-            item(key = "needle_drops_header") {
+        if (activeFilter == HomeFeedFilter.ALL && visibleMoodTracks.isNotEmpty()) {
+            item(key = "needle_drops_header", contentType = "section_header") {
                 SectionShelfHeader(
                     title = stringResource(R.string.section_featured),
                     tag = uiState.activeMoodLabel.uppercase()
                 )
             }
-            val tracksSubset = uiState.moodTracks.take(8)
-            items(tracksSubset, key = { "home_track_${it.id}" }) { track ->
+            val tracksSubset = visibleMoodTracks.take(8)
+            items(
+                items = tracksSubset,
+                key = { "home_track_${it.id}" },
+                contentType = { "track_row" }
+            ) { track ->
+                val isDownloaded = track.id in downloadedTrackIds || track.isDownloaded
+                val isUnplayable = (!track.isPlayable || track.id in unplayableTrackIds) && !isDownloaded
                 NothingTrackRow(
                     track = track,
                     isCurrentTrack = track.id == currentTrackId,
                     isPlaying = isPlaying && track.id == currentTrackId,
                     isSaved = track.id in savedIds,
-                    isDownloaded = track.id in downloadedTrackIds,
+                    isDownloaded = isDownloaded,
+                    isUnplayable = isUnplayable,
                     downloadProgress = downloadProgress[track.id],
-                    onPlayClick = { onPlayTrack(track, uiState.moodTracks) },
+                    onPlayClick = { onPlayTrack(track, visibleMoodTracks) },
                     onToggleSave = { onToggleSave(track) },
                     onSwipeAddToQueue = { onSwipeAddToQueue(track) },
                     onLongClick = { onLongClickTrack(track) },
@@ -471,6 +644,7 @@ fun DiscoverScreen(
 private fun RecentPlaylistsCompactGrid(
     tiles: List<RecentGridTile>,
     onClickTile: (RecentGridTile) -> Unit,
+    onLongPressTile: (RecentGridTile) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val rows = remember(tiles) { tiles.take(8).chunked(2) }
@@ -481,7 +655,7 @@ private fun RecentPlaylistsCompactGrid(
             .testTag("home_recent_grid"),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        rows.forEachIndexed { rowIdx, pair ->
+        rows.forEachIndexed { _, pair ->
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -490,6 +664,7 @@ private fun RecentPlaylistsCompactGrid(
                     RecentCompactPlaylistTile(
                         tile = tile,
                         onClick = { onClickTile(tile) },
+                        onLongPress = { onLongPressTile(tile) },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -501,12 +676,15 @@ private fun RecentPlaylistsCompactGrid(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun RecentCompactPlaylistTile(
     tile: RecentGridTile,
     onClick: () -> Unit,
+    onLongPress: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val haptic = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val scale by animateFloatAsState(
@@ -527,10 +705,14 @@ private fun RecentCompactPlaylistTile(
                 color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.10f),
                 shape = shape
             )
-            .clickable(
+            .combinedClickable(
                 interactionSource = interactionSource,
                 indication = ripple(),
-                onClick = onClick
+                onClick = onClick,
+                onLongClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onLongPress()
+                }
             )
             .testTag("recent_grid_tile_${tile.id}"),
         verticalAlignment = Alignment.CenterVertically
@@ -641,8 +823,9 @@ private fun PickedForYouVinylCard(
     val artReq = remember(track.artworkUrl) {
         ImageRequest.Builder(context)
             .data(track.artworkUrl)
-            .crossfade(180)
             .size(360)
+            .precision(Precision.INEXACT)
+            .allowHardware(true)
             .build()
     }
 
@@ -745,20 +928,18 @@ private fun PickedForYouVinylCard(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text(
+                        NothingSlowMarqueeText(
                             text = track.album.ifBlank { track.title },
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
+                            modifier = Modifier.fillMaxWidth()
                         )
                         Spacer(modifier = Modifier.height(2.dp))
-                        Text(
+                        NothingSlowMarqueeText(
                             text = track.artist,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            modifier = Modifier.fillMaxWidth()
                         )
                     }
 
@@ -780,9 +961,10 @@ private fun PickedForYouVinylCard(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
+                // Right-aligned action cluster: clean containerless `+` button directly beside Play
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
@@ -790,16 +972,6 @@ private fun PickedForYouVinylCard(
                         modifier = Modifier
                             .minimumInteractiveComponentSize()
                             .size(40.dp)
-                            .clip(CircleShape)
-                            .border(
-                                width = 1.dp,
-                                color = if (isSaved) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
-                                },
-                                shape = CircleShape
-                            )
                             .testTag("picked_card_save")
                     ) {
                         Icon(
@@ -808,9 +980,9 @@ private fun PickedForYouVinylCard(
                             tint = if (isSaved) {
                                 MaterialTheme.colorScheme.primary
                             } else {
-                                MaterialTheme.colorScheme.onSurface
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f)
                             },
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(22.dp)
                         )
                     }
 
@@ -846,7 +1018,7 @@ private fun SquarePlaylistCarouselSection(
     tag: String,
     playlists: List<SuggestedPlaylist>,
     onOpenPlaylist: (SuggestedPlaylist) -> Unit,
-    onQuickPlayPlaylist: (SuggestedPlaylist) -> Unit
+    onManagePlaylist: (SuggestedPlaylist) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SectionShelfHeader(title = title, tag = tag)
@@ -855,11 +1027,15 @@ private fun SquarePlaylistCarouselSection(
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(playlists, key = { "${tag}_${it.id}" }) { playlist ->
+            itemsIndexed(
+                items = playlists,
+                key = { idx, pl -> "${tag}_${pl.id}_$idx" },
+                contentType = { _, _ -> "square_playlist_tile" }
+            ) { _, playlist ->
                 SquareVinylPlaylistTile(
                     playlist = playlist,
                     onClick = { onOpenPlaylist(playlist) },
-                    onLongPressPlay = { onQuickPlayPlaylist(playlist) }
+                    onOpenManage = { onManagePlaylist(playlist) }
                 )
             }
         }
@@ -901,16 +1077,16 @@ private fun SectionShelfHeader(
 /**
  * Practical Minimal Square Sleeve Playlist Tile (`154.dp × 154.dp` square cover):
  * - Clean source badge (`SPOTIFY`, `YTM`, `NCHORD`, `VINYL LP`) top-left
- * - Signature color bar + title overlay at bottom of sleeve (inspired by Spotify Mixes in Nothing aesthetic)
+ * - Quick `⋮` manage menu pill top-right + long-press anywhere to Play / Shuffle / Remove from Home / Delete
+ * - Signature color bar + title overlay at bottom of sleeve
  * - Descriptive 2-line artist/curator caption below
- * - Tap opens playlist; long-press starts instant playback
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SquareVinylPlaylistTile(
     playlist: SuggestedPlaylist,
     onClick: () -> Unit,
-    onLongPressPlay: () -> Unit
+    onOpenManage: () -> Unit
 ) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
@@ -926,8 +1102,9 @@ private fun SquareVinylPlaylistTile(
     val imageReq = remember(playlist.artworkUrl) {
         ImageRequest.Builder(context)
             .data(playlist.artworkUrl)
-            .crossfade(160)
             .size(360)
+            .precision(Precision.INEXACT)
+            .allowHardware(true)
             .build()
     }
 
@@ -941,7 +1118,7 @@ private fun SquareVinylPlaylistTile(
                 onClick = onClick,
                 onLongClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onLongPressPlay()
+                    onOpenManage()
                 }
             )
             .testTag("square_playlist_tile_${playlist.id}")
@@ -987,9 +1164,9 @@ private fun SquareVinylPlaylistTile(
                     .fillMaxSize()
                     .background(
                         Brush.verticalGradient(
-                            0.0f to Color.Black.copy(alpha = 0.18f),
+                            0.0f to Color.Black.copy(alpha = 0.24f),
                             0.45f to Color.Transparent,
-                            1.0f to Color.Black.copy(alpha = 0.82f)
+                            1.0f to Color.Black.copy(alpha = 0.84f)
                         )
                     )
             )
@@ -1022,6 +1199,37 @@ private fun SquareVinylPlaylistTile(
                             letterSpacing = 0.7.sp
                         ),
                         color = Color.White
+                    )
+                }
+            }
+
+            // Minimal `⋮` Crate Action Trigger (Top Right, 48dp accessible hit target)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .size(48.dp)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onOpenManage
+                    )
+                    .testTag("square_playlist_more_${playlist.id}"),
+                contentAlignment = Alignment.TopEnd
+            ) {
+                Box(
+                    modifier = Modifier
+                        .padding(top = 6.dp, end = 6.dp)
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.62f))
+                        .border(0.6.dp, Color.White.copy(alpha = 0.18f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.MoreVert,
+                        contentDescription = "Manage ${playlist.title}",
+                        tint = Color.White.copy(alpha = 0.90f),
+                        modifier = Modifier.size(14.dp)
                     )
                 }
             }
@@ -1073,3 +1281,158 @@ private fun SquareVinylPlaylistTile(
         )
     }
 }
+
+private fun isRecentTileHidden(tile: RecentGridTile, hiddenKeys: Set<String>): Boolean {
+    if (tile.id in hiddenKeys) return true
+    val pid = tile.referenceId.takeIf { it.isNotBlank() } ?: return false
+    return pid in hiddenKeys || "upl_$pid" in hiddenKeys || "sp_$pid" in hiddenKeys || "cur_$pid" in hiddenKeys
+}
+
+private fun isSuggestedPlaylistHidden(pl: SuggestedPlaylist, hiddenKeys: Set<String>): Boolean {
+    if (hiddenKeys.isEmpty()) return false
+    if (pl.id in hiddenKeys || "cur_${pl.id}" in hiddenKeys) return true
+    val ext = pl.externalPlaylistId
+    return ext != null && (ext in hiddenKeys || "sp_$ext" in hiddenKeys)
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HomePlaylistManageSheet(
+    title: String,
+    subtitle: String,
+    badge: String,
+    canShuffle: Boolean,
+    canDeletePermanently: Boolean,
+    onDismiss: () -> Unit,
+    onPlayNow: () -> Unit,
+    onShufflePlay: () -> Unit,
+    onRemoveFromHome: () -> Unit,
+    onDeletePlaylist: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = Color(0xFF111216),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp),
+        modifier = Modifier.testTag("home_playlist_manage_sheet")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(start = 22.dp, end = 22.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                text = badge.uppercase(),
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFamily = MonoFontFamily,
+                    letterSpacing = 1.2.sp
+                ),
+                color = Color(0xFFD71921)
+            )
+            Text(
+                text = title,
+                style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
+                color = Color.White,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.62f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+
+            PlaylistSheetActionRow(
+                icon = Icons.Filled.PlayArrow,
+                label = "Play Now",
+                sublabel = "Start immediate playback from first track",
+                tint = Color.White,
+                tag = "home_playlist_action_play",
+                onClick = onPlayNow
+            )
+
+            if (canShuffle) {
+                PlaylistSheetActionRow(
+                    icon = Icons.Filled.Shuffle,
+                    label = "Shuffle Crate",
+                    sublabel = "Randomize order and start playing",
+                    tint = Color.White,
+                    tag = "home_playlist_action_shuffle",
+                    onClick = onShufflePlay
+                )
+            }
+
+            PlaylistSheetActionRow(
+                icon = Icons.Filled.RemoveCircleOutline,
+                label = "Remove from Home",
+                sublabel = "Dismiss this playlist from your Home screen shelves",
+                tint = Color.White.copy(alpha = 0.90f),
+                tag = "home_playlist_action_remove_home",
+                onClick = onRemoveFromHome
+            )
+
+            if (canDeletePermanently) {
+                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+                PlaylistSheetActionRow(
+                    icon = Icons.Filled.DeleteOutline,
+                    label = "Delete Playlist",
+                    sublabel = "Permanently remove this playlist from NChord & Library",
+                    tint = Color(0xFFD71921),
+                    tag = "home_playlist_action_delete",
+                    onClick = onDeletePlaylist
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaylistSheetActionRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    sublabel: String,
+    tint: Color,
+    tag: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 11.dp)
+            .testTag(tag),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = tint,
+            modifier = Modifier.size(22.dp)
+        )
+        Spacer(modifier = Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = tint
+            )
+            Text(
+                text = sublabel,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.56f)
+            )
+        }
+    }
+}
+

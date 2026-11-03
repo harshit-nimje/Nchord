@@ -8,6 +8,8 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -104,6 +106,9 @@ interface MusicDao {
     @Query("DELETE FROM recent_collections WHERE referenceId = :referenceId")
     suspend fun deleteRecentCollectionByRef(referenceId: String)
 
+    @Query("DELETE FROM recent_collections WHERE id = :id")
+    suspend fun deleteRecentCollectionById(id: String)
+
     // User & Synced Playlists
     @Query("SELECT * FROM user_playlists ORDER BY updatedAt DESC")
     fun observeUserPlaylists(): Flow<List<UserPlaylistEntity>>
@@ -167,7 +172,7 @@ interface MusicDao {
         PinnedLibraryItemEntity::class,
         RecentCollectionEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class NothingChordDatabase : RoomDatabase() {
@@ -177,13 +182,46 @@ abstract class NothingChordDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: NothingChordDatabase? = null
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_saved_tracks_savedAt` ON `saved_tracks` (`savedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_scrobble_history_playedAt` ON `scrobble_history` (`playedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_scrobble_history_syncedToScrobbler_playedAt` ON `scrobble_history` (`syncedToScrobbler`, `playedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_scrobble_history_trackId` ON `scrobble_history` (`trackId`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_user_playlists_updatedAt` ON `user_playlists` (`updatedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_playlist_tracks_playlistId_position_addedAt` ON `playlist_tracks` (`playlistId`, `position`, `addedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_downloaded_tracks_downloadedAt` ON `downloaded_tracks` (`downloadedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_recent_collections_playedAt` ON `recent_collections` (`playedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_recent_collections_referenceId` ON `recent_collections` (`referenceId`)"
+                )
+            }
+        }
+
         fun getInstance(context: Context): NothingChordDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     NothingChordDatabase::class.java,
                     "nothing_chord_vault.db"
-                ).fallbackToDestructiveMigration(true)
+                ).addMigrations(MIGRATION_3_4)
+                    .fallbackToDestructiveMigrationFrom(dropAllTables = true, 1, 2)
                     .build()
                     .also { INSTANCE = it }
             }

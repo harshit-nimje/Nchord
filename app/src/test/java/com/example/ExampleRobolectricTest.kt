@@ -18,10 +18,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.unit.dp
 import androidx.room.Room
@@ -76,19 +79,24 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `spotify pkce s256 challenge and redirect uri generation includes write sync scopes`() {
+    fun `spotify pkce s256 challenge state nonce and redirect uri generation enforces least privilege scopes`() {
         val verifier = SpotifyPkceHelper.generateCodeVerifier()
         assertTrue(verifier.length >= 43)
+        val state = SpotifyPkceHelper.generateStateNonce()
+        assertTrue(state.length >= 24)
         val challenge = SpotifyPkceHelper.generateCodeChallenge(verifier)
         assertTrue(challenge.isNotBlank())
-        val authUri = SpotifyPkceHelper.buildAuthorizationUri("test_client_123", challenge)
+        val authUri = SpotifyPkceHelper.buildAuthorizationUri("test_client_123", challenge, state)
         assertEquals("https", authUri.scheme)
         assertEquals("accounts.spotify.com", authUri.host)
         assertEquals("nothingchord://callback", authUri.getQueryParameter("redirect_uri"))
         assertEquals("S256", authUri.getQueryParameter("code_challenge_method"))
+        assertEquals(state, authUri.getQueryParameter("state"))
         val scopes = authUri.getQueryParameter("scope").orEmpty()
-        assertTrue(scopes.contains("user-library-modify"))
-        assertTrue(scopes.contains("playlist-modify-private"))
+        assertTrue(scopes.contains("user-library-read"))
+        assertTrue(scopes.contains("user-modify-playback-state"))
+        org.junit.Assert.assertFalse(scopes.contains("user-library-modify"))
+        org.junit.Assert.assertFalse(scopes.contains("playlist-modify-private"))
     }
 
     @Test
@@ -457,11 +465,101 @@ class ExampleRobolectricTest {
         }
 
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("header_engine_pill").assertDoesNotExist()
         composeTestRule.onNodeWithTag("account_button").performClick()
         composeTestRule.waitForIdle()
         assertTrue("Expected top-left Account button click to trigger Account page", accountClicked)
+        composeTestRule.onNodeWithTag("studio_master_counter_card").assertExists()
+        composeTestRule.onNodeWithTag("studio_circadian_card").assertExists()
+        // Verify playback speed controls were removed from Studio page per user request
+        composeTestRule.onNodeWithTag("studio_pitch_deck_card").assertDoesNotExist()
         composeTestRule.onNodeWithTag("studio_telemetry_list").performScrollToIndex(2)
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("studio_sonic_dna_card").assertExists()
+        composeTestRule.onNodeWithTag("studio_telemetry_list").performScrollToIndex(4)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("studio_scrobbler_dial_circle").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("scrobbler_connection_sheet").assertExists()
+    }
+
+    @Test
+    fun `search separates original top match above more results and dims or hides unplayable songs`() {
+        val playable = TrackItem(
+            id = "ok_track",
+            title = "Digital Love",
+            artist = "Daft Punk",
+            album = "Discovery",
+            artworkUrl = "",
+            audioStreamUrl = "https://example.com/ok.mp4",
+            durationMs = 301_000L,
+            isPlayable = true
+        )
+        val slowedCopy = TrackItem(
+            id = "slowed_copy",
+            title = "Digital Love (Slowed + Reverb)",
+            artist = "TikTok Edits",
+            album = "Slowed Bootleg",
+            artworkUrl = "",
+            audioStreamUrl = "https://example.com/slow.mp4",
+            durationMs = 340_000L,
+            isPlayable = true
+        )
+        val unplayable = TrackItem(
+            id = "dead_track",
+            title = "Region Locked Cut",
+            artist = "Unknown Vault",
+            album = "Vault",
+            artworkUrl = "",
+            audioStreamUrl = null,
+            durationMs = 210_000L,
+            isPlayable = false
+        )
+        var hideUnplayable by mutableStateOf(false)
+
+        composeTestRule.setContent {
+            NothingChordTheme(darkTheme = true) {
+                SearchScreen(
+                    uiState = NothingUiState(
+                        searchQuery = "Digital Love",
+                        searchFilter = SearchFilter.SONGS,
+                        searchResults = listOf(slowedCopy, playable, unplayable)
+                    ),
+                    currentTrackId = null,
+                    isPlaying = false,
+                    savedIds = emptySet(),
+                    unplayableTrackIds = setOf("dead_track"),
+                    hideUnplayableSongs = hideUnplayable,
+                    onQueryChange = {},
+                    onToggleSource = {},
+                    onSelectFilter = {},
+                    onOpenPlaylist = {},
+                    onImportPlaylistUrl = {},
+                    onPlayTrack = { _, _ -> },
+                    onToggleSave = {},
+                    onSwipeAddToQueue = {},
+                    onLongClickTrack = {}
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        // Original playable song is separated into the dedicated Top Match card above MORE RESULTS
+        composeTestRule.onNodeWithTag("search_top_match_card").assertExists()
+        composeTestRule.onNodeWithTag("search_more_results_header").assertExists()
+        composeTestRule.onNodeWithTag("track_item_card_slowed_copy").assertExists()
+        composeTestRule.onNodeWithTag("search_results_list")
+            .performScrollToNode(hasTestTag("track_item_card_dead_track"))
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("track_item_card_dead_track").assertExists()
+        composeTestRule.onNodeWithTag("unplayable_badge_dead_track", useUnmergedTree = true).assertExists()
+
+        hideUnplayable = true
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("track_item_card_dead_track").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("search_results_list").performScrollToIndex(0)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("search_top_match_card").assertExists()
     }
 
     @Test
@@ -694,7 +792,251 @@ class ExampleRobolectricTest {
         composeTestRule.waitForIdle()
         assertEquals(500L, adjustedOffsetDelta)
     }
+
+    @Test
+    fun `room migration 3 to 4 preserves user rows and builds query indices non destructively`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val dbFile = context.getDatabasePath("nchord_migration_3_4_test.db")
+        dbFile.parentFile?.mkdirs()
+        if (dbFile.exists()) dbFile.delete()
+
+        try {
+            // 1. Bootstrap a real SQLite v3 database and insert user data across tables
+            val rawV3 = android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(dbFile, null)
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `saved_tracks` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `artworkUrl` TEXT NOT NULL, `audioStreamUrl` TEXT, `durationMs` INTEGER NOT NULL, `sourceTypeName` TEXT NOT NULL, `externalSpotifyUri` TEXT, `albumId` TEXT, `artistId` TEXT, `spotifyTrackId` TEXT, `youtubeVideoId` TEXT, `savedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))"
+            )
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `scrobble_history` (`scrobbleId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `trackId` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `artworkUrl` TEXT NOT NULL, `audioStreamUrl` TEXT, `durationMs` INTEGER NOT NULL, `sourceTypeName` TEXT NOT NULL, `albumId` TEXT, `artistId` TEXT, `spotifyTrackId` TEXT, `isOfflinePlay` INTEGER NOT NULL, `syncedToScrobbler` INTEGER NOT NULL, `playedAt` INTEGER NOT NULL)"
+            )
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `user_playlists` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `description` TEXT NOT NULL, `coverArtworkUrl` TEXT NOT NULL, `spotifyPlaylistId` TEXT, `youtubePlaylistId` TEXT, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))"
+            )
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `playlist_tracks` (`playlistId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `position` INTEGER NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `artworkUrl` TEXT NOT NULL, `audioStreamUrl` TEXT, `durationMs` INTEGER NOT NULL, `sourceTypeName` TEXT NOT NULL, `youtubeVideoId` TEXT, `externalSpotifyUri` TEXT, `albumId` TEXT, `artistId` TEXT, `spotifyTrackId` TEXT, `addedAt` INTEGER NOT NULL, PRIMARY KEY(`playlistId`, `trackId`))"
+            )
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `downloaded_tracks` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `artworkUrl` TEXT NOT NULL, `localFilePath` TEXT NOT NULL, `fileSizeBytes` INTEGER NOT NULL, `codecLabel` TEXT NOT NULL, `bitrateKbps` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `sourceTypeName` TEXT NOT NULL, `youtubeVideoId` TEXT, `externalSpotifyUri` TEXT, `spotifyTrackId` TEXT, `albumId` TEXT, `artistId` TEXT, `downloadedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))"
+            )
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `pinned_library_items` (`itemKey` TEXT NOT NULL, `pinnedAt` INTEGER NOT NULL, PRIMARY KEY(`itemKey`))"
+            )
+            rawV3.execSQL(
+                "CREATE TABLE IF NOT EXISTS `recent_collections` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `subtitle` TEXT NOT NULL, `artworkUrl` TEXT NOT NULL, `kindName` TEXT NOT NULL, `referenceId` TEXT NOT NULL, `playedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))"
+            )
+            rawV3.execSQL(
+                "INSERT INTO `saved_tracks` (`id`, `title`, `artist`, `album`, `artworkUrl`, `audioStreamUrl`, `durationMs`, `sourceTypeName`, `externalSpotifyUri`, `savedAt`) VALUES ('saved_v3_1', 'Something About Us', 'Daft Punk', 'Discovery', '', 'https://example.com/sau.mp4', 231000, 'YTM_ADFREE', NULL, 1700000000)"
+            )
+            rawV3.version = 3
+            rawV3.close()
+
+            // 2. Open with Room v4 + MIGRATION_3_4 (NO global destructive fallback!)
+            val migratedDb = Room.databaseBuilder(
+                context,
+                NothingChordDatabase::class.java,
+                dbFile.name
+            ).addMigrations(NothingChordDatabase.MIGRATION_3_4)
+                .allowMainThreadQueries()
+                .build()
+
+            val preservedSaved = runBlocking { migratedDb.musicDao().observeSavedTracks().first() }
+            assertEquals("Expected v3 saved track to survive non-destructive v4 migration", 1, preservedSaved.size)
+            assertEquals("Something About Us", preservedSaved.first().title)
+            migratedDb.close()
+        } finally {
+            dbFile.delete()
+        }
+    }
+
+    @Test
+    fun `runtime caches configure 32mb okhttp cache and moshi ksp adapters parse dtos without kotlin reflection`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        com.example.data.remote.NetworkModule.initializeRuntimeCaches(context)
+        assertEquals(
+            32L * 1024L * 1024L,
+            com.example.data.remote.NetworkModule.activeHttpCacheSizeMaxBytes()
+        )
+
+        // Verify zero-reflection Moshi KSP generated adapters deserialize Spotify & LrcLib DTOs cleanly
+        val moshi = com.squareup.moshi.Moshi.Builder().build()
+        val tokenJson = """{"access_token":"tok_abc","token_type":"Bearer","expires_in":3600,"refresh_token":"ref_xyz"}"""
+        val tokenDto = moshi.adapter(com.example.data.remote.SpotifyTokenResponseDto::class.java).fromJson(tokenJson)
+        assertNotNull(tokenDto)
+        assertEquals("tok_abc", tokenDto?.accessToken)
+        assertEquals("ref_xyz", tokenDto?.refreshToken)
+
+        val lrcJson = """{"id":99,"trackName":"Veridis Quo","artistName":"Daft Punk","syncedLyrics":"[00:01.00] Tune"}"""
+        val lrcDto = moshi.adapter(com.example.data.remote.LrcLibResponseDto::class.java).fromJson(lrcJson)
+        assertNotNull(lrcDto)
+        assertEquals("Veridis Quo", lrcDto?.trackName)
+    }
+
+    @Test
+    fun `home playlists support remove from home and delete actions and dock search re-tap requests keyboard`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, NothingChordDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = com.example.data.repository.NothingMusicRepository(
+            musicDao = db.musicDao(),
+            prefsStore = com.example.data.local.NothingPreferencesStore(context),
+            downloadManager = com.example.data.local.InAppDownloadManager(context)
+        )
+        val audioEngine = com.example.player.NothingAudioEngine(context)
+        val vm = com.example.ui.NothingChordViewModel(context, repo, audioEngine)
+
+        try {
+            assertEquals(0, vm.uiState.value.searchKeyboardRequestNonce)
+            // First tap switches active tab from HOME -> SEARCH without forcing keyboard
+            vm.selectTab(com.example.ui.NothingTab.SEARCH)
+            assertEquals(com.example.ui.NothingTab.SEARCH, vm.uiState.value.activeTab)
+            assertEquals(0, vm.uiState.value.searchKeyboardRequestNonce)
+
+            // Pressing Search on the dock AGAIN while already on Search increments keyboard request nonce
+            vm.selectTab(com.example.ui.NothingTab.SEARCH)
+            assertEquals(1, vm.uiState.value.searchKeyboardRequestNonce)
+
+            var removedPlaylistId: String? = null
+            var deletedPlaylistId: String? = null
+            val garbagePl = com.example.data.model.SuggestedPlaylist(
+                id = "garbage_mix_1",
+                title = "Unwanted Garbage Mix",
+                subtitle = "Noise",
+                badge = "NCHORD",
+                artworkUrl = "",
+                trackCount = 8
+            )
+            val spotlight = TrackItem(
+                id = "spot_1",
+                title = "Instant Crush",
+                artist = "Daft Punk",
+                album = "Random Access Memories",
+                artworkUrl = "",
+                audioStreamUrl = "https://example.com/ic.mp4",
+                durationMs = 337_000L
+            )
+
+            composeTestRule.setContent {
+                NothingChordTheme(darkTheme = true) {
+                    com.example.ui.screens.DiscoverScreen(
+                        uiState = NothingUiState(
+                            isDiscoverLoading = false,
+                            featuredTracks = listOf(spotlight),
+                            suggestedPlaylists = listOf(garbagePl)
+                        ),
+                        recentGridTiles = emptyList(),
+                        downloadedTrackIds = emptySet(),
+                        downloadProgress = emptyMap(),
+                        offlineTracks = emptyList(),
+                        currentTrackId = null,
+                        isPlaying = false,
+                        savedIds = emptySet(),
+                        onSelectHomeFilter = {},
+                        onSelectMood = {},
+                        onOpenRecentTile = {},
+                        onOpenCarouselPlaylist = {},
+                        onPlayCarouselPlaylist = { _, _ -> },
+                        onRemoveCarouselPlaylistFromHome = { removedPlaylistId = it.id },
+                        onDeleteCarouselPlaylist = { deletedPlaylistId = it.id },
+                        onOpenAlbumForTrack = {},
+                        onPlayTrack = { _, _ -> },
+                        onToggleSave = {},
+                        onSwipeAddToQueue = {},
+                        onLongClickTrack = {},
+                        onRetryLoad = {}
+                    )
+                }
+            }
+
+            composeTestRule.waitForIdle()
+            // Picked for you renders both save (+) and play side-by-side cleanly
+            composeTestRule.onNodeWithTag("picked_card_save").assertExists()
+            composeTestRule.onNodeWithTag("picked_card_play").assertExists()
+
+            // Open playlist manage sheet from Home tile and remove from Home
+            composeTestRule.onNodeWithTag("square_playlist_more_garbage_mix_1").performClick()
+            composeTestRule.waitForIdle()
+            composeTestRule.onNodeWithTag("home_playlist_manage_sheet").assertExists()
+            composeTestRule.onNodeWithTag("home_playlist_action_remove_home").performClick()
+            composeTestRule.waitForIdle()
+            assertEquals("garbage_mix_1", removedPlaylistId)
+
+            // Re-open playlist manage sheet and delete playlist permanently
+            composeTestRule.onNodeWithTag("square_playlist_more_garbage_mix_1").performClick()
+            composeTestRule.waitForIdle()
+            composeTestRule.onNodeWithTag("home_playlist_action_delete")
+                .performScrollTo()
+                .performClick()
+            composeTestRule.waitForIdle()
+            assertEquals("garbage_mix_1", deletedPlaylistId)
+        } finally {
+            audioEngine.release()
+            db.close()
+        }
+    }
+
+    @Test
+    fun `display refresh rate card reflects 144hz peak panel capability and toggles locked 144hz policy`() {
+        var selectedPolicy = com.example.data.model.DisplayRefreshPolicy.HIGH
+        composeTestRule.setContent {
+            androidx.compose.runtime.CompositionLocalProvider(
+                com.example.ui.components.LocalPeakDisplayRefreshHz provides 144
+            ) {
+                NothingChordTheme(darkTheme = true) {
+                    com.example.ui.screens.SourcesAndGlyphScreen(
+                        uiState = NothingUiState(),
+                        settings = com.example.data.model.GlyphSettings(
+                            displayRefreshPolicy = selectedPolicy
+                        ),
+                        scrobblerState = com.example.data.model.ScrobblerConfigAndState(),
+                        totalScrobbles = 12,
+                        totalStreamedMs = 3_600_000L,
+                        savedCount = 4,
+                        onSaveClientId = {},
+                        onConnectSpotify = {},
+                        onOpenSpotifyDashboard = {},
+                        onSyncSpotify = {},
+                        onDisconnectSpotify = {},
+                        onConnectLastFm = { _, _ -> },
+                        onConnectListenBrainz = { _, _ -> },
+                        onSyncScrobblerNow = {},
+                        onDisconnectScrobbler = {},
+                        onOpenPlaylist = {},
+                        onOpenArtist = {},
+                        onRemoteAction = {},
+                        onSelectAudioQuality = {},
+                        onToggleBitPerfectUsb = {},
+                        onOpenSystemEqualizer = {},
+                        onImportPlaylistUrl = {},
+                        onToggleYtmEngine = {},
+                        onUpdatePipedInstance = {},
+                        onToggleOled = {},
+                        onToggleGlyphReactive = {},
+                        onToggleAutomix = {},
+                        onToggleHideUnplayable = {},
+                        onSelectDisplayRefreshPolicy = { selectedPolicy = it },
+                        onToggleHaptics = {},
+                        onReopenOnboarding = {},
+                        onBack = {}
+                    )
+                }
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("sources_hub_list")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("display_refresh_active_badge"))
+        composeTestRule.onNodeWithTag("display_refresh_active_badge").assertExists()
+        val batteryTag = "refresh_policy_${com.example.data.model.DisplayRefreshPolicy.BATTERY_SAVER.id}"
+        composeTestRule.onNodeWithTag("sources_hub_list")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(batteryTag))
+        composeTestRule.onNodeWithTag(batteryTag).performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(com.example.data.model.DisplayRefreshPolicy.BATTERY_SAVER, selectedPolicy)
+    }
 }
+
+
 
 
 

@@ -1,15 +1,18 @@
 package com.example.data.remote
 
 import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
 import retrofit2.http.GET
 import retrofit2.http.Query
 import retrofit2.http.Url
 
+@JsonClass(generateAdapter = true)
 data class ItunesSearchResponse(
     @Json(name = "resultCount") val resultCount: Int = 0,
     @Json(name = "results") val results: List<ItunesTrackDto> = emptyList()
 )
 
+@JsonClass(generateAdapter = true)
 data class ItunesTrackDto(
     @Json(name = "trackId") val trackId: Long? = null,
     @Json(name = "trackName") val trackName: String? = null,
@@ -31,10 +34,12 @@ interface ItunesMusicApi {
 }
 
 // Piped / YouTube Music Ad-Free Full-Track Streaming DTOs
+@JsonClass(generateAdapter = true)
 data class PipedSearchResponseDto(
     @Json(name = "items") val items: List<PipedSearchItemDto> = emptyList()
 )
 
+@JsonClass(generateAdapter = true)
 data class PipedSearchItemDto(
     @Json(name = "url") val url: String? = null, // e.g., "/watch?v=VIDEO_ID"
     @Json(name = "title") val title: String? = null,
@@ -43,6 +48,7 @@ data class PipedSearchItemDto(
     @Json(name = "duration") val duration: Long? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class PipedStreamResponseDto(
     @Json(name = "title") val title: String? = null,
     @Json(name = "uploader") val uploader: String? = null,
@@ -51,6 +57,7 @@ data class PipedStreamResponseDto(
     @Json(name = "audioStreams") val audioStreams: List<PipedAudioStreamDto> = emptyList()
 )
 
+@JsonClass(generateAdapter = true)
 data class PipedAudioStreamDto(
     @Json(name = "url") val url: String? = null,
     @Json(name = "mimeType") val mimeType: String? = null,
@@ -70,6 +77,7 @@ interface YouTubePipedApi {
     ): PipedStreamResponseDto
 }
 
+@JsonClass(generateAdapter = true)
 data class LrcLibResponseDto(
     @Json(name = "id") val id: Long? = null,
     @Json(name = "trackName") val trackName: String? = null,

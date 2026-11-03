@@ -85,7 +85,8 @@ data class TrackItem(
     val spotifyTrackId: String? = null,
     val streamQualityBadge: String? = null,
     val isDownloaded: Boolean = false,
-    val localFilePath: String? = null
+    val localFilePath: String? = null,
+    val isPlayable: Boolean = true
 )
 
 @Immutable
@@ -125,7 +126,9 @@ enum class RecentTileKind {
     DOWNLOADS,
     USER_PLAYLIST,
     SPOTIFY_PLAYLIST,
-    CURATED_PLAYLIST
+    CURATED_PLAYLIST,
+    ALBUM,
+    ARTIST
 }
 
 @Immutable
@@ -183,9 +186,17 @@ data class InsightsSnapshot(
     val peakHour: Int = 22,
     val collectorArchetype: String = "NOCTURNAL VINYL",
     val hourlyMatrix: List<Float> = List(24) { 0f },
+    val hourlyPlayCounts: List<Int> = List(24) { 0 },
     val topArtists: List<ArtistInsightStat> = emptyList(),
     val topTrack: TrackItem? = null,
-    val topTrackPlays: Int = 0
+    val topTrackPlays: Int = 0,
+    val savedTracksCount: Int = 0,
+    val avgTrackDurationSec: Int = 212,
+    val nightSharePercent: Int = 58,
+    val replayLoyaltyPercent: Int = 46,
+    val immersionScorePercent: Int = 64,
+    val vaultAutonomyPercent: Int = 35,
+    val cadenceConsistencyPercent: Int = 52
 )
 
 enum class CollectionPageType {
@@ -254,6 +265,34 @@ enum class RepeatModeState {
     ONE
 }
 
+enum class DisplayRefreshPolicy(
+    val id: String,
+    val label: String,
+    val summary: String
+) {
+    AUTO(
+        id = "auto",
+        label = "Auto",
+        summary = "System LTPO adaptive refresh; scales down automatically in OS Battery Saver"
+    ),
+    HIGH(
+        id = "high",
+        label = "High",
+        summary = "Locks peak native display refresh (120/144Hz) at current screen resolution"
+    ),
+    BATTERY_SAVER(
+        id = "battery_saver",
+        label = "Battery",
+        summary = "60Hz display cap and 30fps ambient motion pacing to extend playback battery"
+    );
+
+    companion object {
+        fun fromId(raw: String?): DisplayRefreshPolicy {
+            return entries.firstOrNull { it.id.equals(raw, ignoreCase = true) } ?: AUTO
+        }
+    }
+}
+
 @Immutable
 data class GlyphSettings(
     val onboardingCompleted: Boolean = false,
@@ -268,5 +307,7 @@ data class GlyphSettings(
     val oledDarkMode: Boolean = true,
     val glyphReactiveLeds: Boolean = true,
     val automixEnabled: Boolean = true,
-    val tactileHaptics: Boolean = true
+    val tactileHaptics: Boolean = true,
+    val hideUnplayableSongs: Boolean = false,
+    val displayRefreshPolicy: DisplayRefreshPolicy = DisplayRefreshPolicy.AUTO
 )

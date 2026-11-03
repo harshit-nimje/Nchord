@@ -37,6 +37,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -161,6 +163,12 @@ class NothingMusicRepository(
 
     val glyphSettingsFlow = prefsStore.glyphSettingsFlow
 
+    val unplayableTrackIdsFlow: Flow<Set<String>> = prefsStore.unplayableTrackIdsFlow
+
+    val hiddenHomePlaylistKeysFlow: Flow<Set<String>> = prefsStore.hiddenHomePlaylistKeysFlow
+
+    private val probeSemaphore = Semaphore(2)
+
     val spotifyAccessTokenFlow = prefsStore.spotifyAccessTokenFlow
 
     suspend fun saveUserSpotifyClientId(clientId: String) {
@@ -172,19 +180,39 @@ class NothingMusicRepository(
         if (clientId.length < 10) return null
         prefsStore.setUserSpotifyClientId(clientId)
         val verifier = SpotifyPkceHelper.generateCodeVerifier()
-        prefsStore.savePkceVerifier(verifier)
+        val state = SpotifyPkceHelper.generateStateNonce()
+        prefsStore.savePkceHandshake(verifier = verifier, state = state)
         val challenge = SpotifyPkceHelper.generateCodeChallenge(verifier)
-        return SpotifyPkceHelper.buildAuthorizationUri(clientId, challenge)
+        return SpotifyPkceHelper.buildAuthorizationUri(
+            clientId = clientId,
+            codeChallenge = challenge,
+            state = state
+        )
     }
 
-    suspend fun handleSpotifyOAuthCode(code: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun abortSpotifyHandshake() {
+        prefsStore.clearPkceHandshake()
+    }
+
+    suspend fun handleSpotifyOAuthCode(
+        code: String,
+        returnedState: String?
+    ): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val clientId = prefsStore.getUserSpotifyClientId()
             if (clientId.isBlank()) {
+                prefsStore.clearPkceHandshake()
                 return@withContext Result.failure(IllegalStateException("Spotify Client ID not configured"))
             }
-            val verifier = prefsStore.getPkceVerifier()
-                ?: return@withContext Result.failure(IllegalStateException("Missing PKCE verifier"))
+            val (verifier, expectedState) = prefsStore.consumePkceHandshake()
+            if (!SpotifyPkceHelper.verifyCallbackState(expectedState, returnedState)) {
+                return@withContext Result.failure(
+                    SecurityException("Spotify OAuth state mismatch — callback rejected")
+                )
+            }
+            if (verifier.isNullOrBlank()) {
+                return@withContext Result.failure(IllegalStateException("Missing PKCE verifier"))
+            }
             val tokenDto = spotifyAccountsApi.exchangeAuthorizationCode(
                 clientId = clientId,
                 code = code,
@@ -398,10 +426,20 @@ class NothingMusicRepository(
             }
         }
 
-    suspend fun fetchSpotifyPlaylistTracks(playlistId: String): Result<List<TrackItem>> =
+    suspend fun fetchSpotifyPlaylistTracks(
+        playlistId: String,
+        fallbackTitleHint: String = ""
+    ): Result<List<TrackItem>> =
         withContext(Dispatchers.IO) {
             try {
-                val cleanId = playlistId.trim().substringAfterLast(":").substringBefore("?")
+                val cleanId = playlistId.trim()
+                    .removePrefix("sp_carousel_")
+                    .removePrefix("sp_search_")
+                    .removePrefix("sp_pl_")
+                    .removePrefix("sp_")
+                    .substringAfterLast(":")
+                    .substringAfterLast("/")
+                    .substringBefore("?")
                 if (cleanId.isBlank()) {
                     return@withContext Result.failure(IllegalArgumentException("Blank Spotify playlist ID"))
                 }
@@ -439,6 +477,20 @@ class NothingMusicRepository(
                 val embedResolved = FullStreamEngine.fetchPublicSpotifyEmbedPlaylist("playlist", cleanId)
                 if (embedResolved.third.isNotEmpty()) {
                     return@withContext Result.success(embedResolved.third)
+                }
+
+                // Restricted algorithmic/editorial playlist fallback via catalog search
+                if (fallbackTitleHint.isNotBlank()) {
+                    val settings = prefsStore.glyphSettingsFlow.first()
+                    val seeded = FullStreamEngine.searchFullTracks(
+                        query = fallbackTitleHint,
+                        limit = 20,
+                        qualityTier = settings.audioQualityTier,
+                        customPipedNode = settings.customPipedInstance
+                    )
+                    if (seeded.isNotEmpty()) {
+                        return@withContext Result.success(seeded)
+                    }
                 }
 
                 Result.failure(IllegalStateException("Unable to load Spotify playlist tracks"))
@@ -588,6 +640,7 @@ class NothingMusicRepository(
         val artwork = albumObj?.optJSONArray("images")?.optJSONObject(0)?.optString("url").orEmpty()
         val durationMs = obj.optLong("duration_ms", 210_000L).coerceAtLeast(45_000L)
         val uri = obj.optString("uri").ifBlank { "spotify:track:$idVal" }
+        val playable = obj.optBoolean("is_playable", true) && obj.optJSONObject("restrictions") == null
 
         return TrackItem(
             id = "sp_$idVal",
@@ -601,7 +654,8 @@ class NothingMusicRepository(
             externalSpotifyUri = uri,
             spotifyTrackId = idVal,
             artistId = primaryArtistId,
-            streamQualityBadge = "SPOTIFY"
+            streamQualityBadge = "SPOTIFY",
+            isPlayable = playable
         )
     }
 
@@ -673,7 +727,10 @@ class NothingMusicRepository(
     suspend fun fetchCarouselPlaylistTracks(playlist: SuggestedPlaylist): List<TrackItem> {
         val settings = prefsStore.glyphSettingsFlow.first()
         if (playlist.isSpotifyPlaylist && !playlist.externalPlaylistId.isNullOrBlank()) {
-            val spTracks = fetchSpotifyPlaylistTracks(playlist.externalPlaylistId).getOrDefault(emptyList())
+            val spTracks = fetchSpotifyPlaylistTracks(
+                playlistId = playlist.externalPlaylistId,
+                fallbackTitleHint = playlist.seedQuery?.takeIf { it.isNotBlank() } ?: playlist.title
+            ).getOrDefault(emptyList())
             if (spTracks.isNotEmpty()) return spTracks
         }
         return FullStreamEngine.fetchSuggestedPlaylistTracks(playlist, settings.audioQualityTier)
@@ -784,6 +841,44 @@ class NothingMusicRepository(
         musicDao.deleteUserPlaylist(playlistId)
         musicDao.deletePinnedItem("upl_$playlistId")
         musicDao.deleteRecentCollectionByRef(playlistId)
+        musicDao.deleteRecentCollectionById("upl_$playlistId")
+    }
+
+    suspend fun removePlaylistFromHome(
+        keysToHide: Collection<String>,
+        recentId: String? = null,
+        referenceId: String? = null
+    ) = withContext(Dispatchers.IO) {
+        prefsStore.hideHomePlaylistKeys(keysToHide)
+        if (!recentId.isNullOrBlank()) {
+            musicDao.deleteRecentCollectionById(recentId)
+        }
+        if (!referenceId.isNullOrBlank()) {
+            musicDao.deleteRecentCollectionByRef(referenceId)
+            musicDao.deleteRecentCollectionById("cur_$referenceId")
+            musicDao.deleteRecentCollectionById("sp_$referenceId")
+            musicDao.deleteRecentCollectionById("upl_$referenceId")
+        }
+    }
+
+    suspend fun deleteExternalOrCuratedPlaylist(
+        keysToHide: Collection<String>,
+        recentId: String? = null,
+        referenceId: String? = null,
+        pinKey: String? = null
+    ) = withContext(Dispatchers.IO) {
+        removePlaylistFromHome(keysToHide = keysToHide, recentId = recentId, referenceId = referenceId)
+        if (!pinKey.isNullOrBlank()) {
+            musicDao.deletePinnedItem(pinKey)
+        }
+        if (!referenceId.isNullOrBlank()) {
+            musicDao.deletePinnedItem("sp_$referenceId")
+            musicDao.deletePinnedItem("cur_$referenceId")
+        }
+    }
+
+    suspend fun restoreHiddenHomePlaylists() = withContext(Dispatchers.IO) {
+        prefsStore.clearHiddenHomePlaylistKeys()
     }
 
     suspend fun togglePinLibraryItem(itemKey: String): PinToggleOutcome = withContext(Dispatchers.IO) {
@@ -1494,6 +1589,32 @@ class NothingMusicRepository(
     suspend fun setGlyphReactive(enabled: Boolean) = prefsStore.setGlyphReactive(enabled)
     suspend fun setAutomixEnabled(enabled: Boolean) = prefsStore.setAutomixEnabled(enabled)
     suspend fun setTactileHaptics(enabled: Boolean) = prefsStore.setTactileHaptics(enabled)
+    suspend fun setHideUnplayableSongs(enabled: Boolean) = prefsStore.setHideUnplayableSongs(enabled)
+    suspend fun setDisplayRefreshPolicy(policy: com.example.data.model.DisplayRefreshPolicy) =
+        prefsStore.setDisplayRefreshPolicy(policy)
+    suspend fun markTrackUnplayable(trackId: String) = prefsStore.markTrackUnplayable(trackId)
+    suspend fun clearTrackUnplayable(trackId: String) = prefsStore.clearTrackUnplayable(trackId)
+
+    suspend fun probeTracksPlayability(tracks: List<TrackItem>) = withContext(Dispatchers.IO) {
+        if (tracks.isEmpty()) return@withContext
+        val qualityTier = runCatching { prefsStore.glyphSettingsFlow.first().audioQualityTier }
+            .getOrDefault(AudioQualityTier.STUDIO_320)
+        for (track in tracks.take(14)) {
+            if (track.isDownloaded || !track.localFilePath.isNullOrBlank()) continue
+            if (!track.isPlayable) {
+                prefsStore.markTrackUnplayable(track.id)
+                continue
+            }
+            probeSemaphore.withPermit {
+                val playable = runCatching {
+                    FullStreamEngine.quickProbeTrackPlayable(track, qualityTier)
+                }.getOrDefault(true)
+                if (!playable) {
+                    prefsStore.markTrackUnplayable(track.id)
+                }
+            }
+        }
+    }
 
     private fun DownloadedTrackEntity.toDomain(): TrackItem {
         val src = runCatching { AudioSourceType.valueOf(sourceTypeName) }

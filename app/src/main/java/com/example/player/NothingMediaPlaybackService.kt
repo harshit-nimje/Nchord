@@ -148,7 +148,7 @@ class NothingMediaPlaybackService : Service() {
                 }
 
                 builder
-                    .setSmallIcon(R.drawable.ic_vinyl_icon_src)
+                    .setSmallIcon(R.drawable.ic_stat_nchord)
                     .setContentTitle(title)
                     .setContentText(artist)
                     .setSubText(album.ifBlank { "Nchord" })

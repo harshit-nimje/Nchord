@@ -1,15 +1,23 @@
 package com.example.ui.screens
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -19,32 +27,48 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.outlined.Equalizer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -52,26 +76,33 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.data.model.ArtistInsightStat
 import com.example.data.model.InsightsSnapshot
 import com.example.data.model.ScrobblerConfigAndState
 import com.example.data.model.SpotifyProfileState
 import com.example.data.model.TrackItem
+import com.example.ui.components.NothingSlowMarqueeText
 import com.example.ui.theme.MonoFontFamily
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 
+private enum class StudioCounterMode(val label: String, val unitSuffix: String) {
+    MINUTES("MINUTES", "M"),
+    SPINS("SPINS", ""),
+    ARTISTS("ARTISTS", "")
+}
+
 /**
- * Studio Screen — Merged Insights + Studio Telemetry & Taste Profiling.
+ * Clean-Room Nothing OS Acoustic Atelier — Minimalist Sonic Telemetry & Taste Geometry.
  *
- * Strictly pure stats, data, and taste profiling — ZERO song suggestions and ZERO playlists.
- * Modeled directly after the Nothing OS Weather architectural bento grid:
- * - Giant circular dot-matrix primary readout + concise arrow telemetry + dark capsule divider bar
- * - 2-column `aspectRatio(1f)` bento grid combining a pure-white `CircleShape` Taste Index card,
- *   dark `#141416` `RoundedCornerShape(26.dp)` wireframe geometry cards (3D dome ellipses,
- *   8x6 dot-matrix density field, radar cone with `#D71921` red arc, compass taste vector with red `N`,
- *   3D wireframe cylinder vault gauge, circadian arc + top artists), and a dark `CircleShape` scrobbler dial.
+ * Crafted specifically for NChord in Nothing's monochromatic hardware aesthetic:
+ * - Obsidian `#101013` / `#151519` modules with razor-thin `0.85.dp` `#25252C` hairlines,
+ *   corner registration marks, dot-matrix numerals, and restrained `#D71921` Nothing Red telemetry.
+ * - Playback speed controls are intentionally absent from Studio to keep this page focused purely
+ *   on acoustic telemetry, listening cadence, taste DNA, and scrobbler synchronization.
  */
 @Composable
 @Suppress("UNUSED_PARAMETER")
@@ -80,6 +111,7 @@ fun InsightsScreen(
     scrobblerState: ScrobblerConfigAndState,
     spotifyProfile: SpotifyProfileState,
     isPlaying: Boolean,
+    onOpenEqualizer: () -> Unit = {},
     onPlayTopTrack: (TrackItem) -> Unit = {},
     onOpenArtist: (String) -> Unit,
     onConnectLastFm: (username: String, passwordOptional: String) -> Unit,
@@ -88,7 +120,12 @@ fun InsightsScreen(
     onDisconnectScrobbler: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val haptic = LocalHapticFeedback.current
     var showScrobblerSheet by rememberSaveable { mutableStateOf(false) }
+    var counterMode by rememberSaveable { mutableStateOf(StudioCounterMode.MINUTES) }
+    var inspectedHour by rememberSaveable(snapshot.peakHour) {
+        mutableIntStateOf(snapshot.peakHour.coerceIn(0, 23))
+    }
 
     if (showScrobblerSheet) {
         ScrobblerConnectionSheet(
@@ -110,740 +147,1161 @@ fun InsightsScreen(
     }
 
     val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    val cardBg = if (isDark) Color(0xFF141416) else Color(0xFFEDEDEF)
-    val whiteCircleBg = if (isDark) Color(0xFFF2F2F4) else Color(0xFF121214)
-    val whiteCircleFg = if (isDark) Color(0xFF111113) else Color(0xFFF6F6F8)
-    val dividerPillColor = if (isDark) Color(0xFF161618) else Color(0xFFE2E2E6)
-    val onCardPrimary = MaterialTheme.colorScheme.onBackground
-    val onCardSecondary = MaterialTheme.colorScheme.onSurfaceVariant
+    val cardBg = if (isDark) Color(0xFF101013) else Color(0xFFF2F2F5)
+    val cardElevatedBg = if (isDark) Color(0xFF17171C) else Color(0xFFE7E7EC)
+    val hairline = if (isDark) Color(0xFF25252D) else Color(0xFFD5D5DD)
+    val highContrastPillBg = if (isDark) Color(0xFFF5F5F7) else Color(0xFF101013)
+    val highContrastPillFg = if (isDark) Color(0xFF0C0C0F) else Color(0xFFF7F7F9)
+    val onPrimaryText = MaterialTheme.colorScheme.onBackground
+    val onMutedText = MaterialTheme.colorScheme.onSurfaceVariant
     val nothingRed = Color(0xFFD71921)
-    val coolBlue = Color(0xFF6B8AFF)
 
-    // Compute pure Taste Profiling Index (0..99) from artist diversity, streak consistency, and spin depth
-    val rawTasteScore = if (snapshot.totalPlays == 0 && snapshot.uniqueArtistsCount == 0) {
-        72
-    } else {
-        (38 + minOf(snapshot.uniqueArtistsCount * 4, 34) +
-            minOf(snapshot.streakDays * 3, 15) +
-            minOf(snapshot.totalPlays / 4, 12)).coerceIn(18, 99)
-    }
-
-    val peakPhaseLabel = when (snapshot.peakHour) {
-        in 0..4 -> "Afterhours"
-        in 5..10 -> "Morning"
-        in 11..16 -> "Daylight"
-        in 17..20 -> "Dusk"
-        else -> "Nocturnal"
-    }
-
-    val tasteCharacter = when {
-        snapshot.uniqueArtistsCount >= 12 -> "Eclectic"
-        snapshot.uniqueArtistsCount >= 5 -> "Focused"
-        snapshot.totalPlays > 0 -> "Deep Cut"
-        else -> "Calibrating"
-    }
-
-    val dominantDirectionDeg = ((snapshot.peakHour / 24f) * 360f + snapshot.uniqueArtistsCount * 17f) % 360f
+    val cardShape = RoundedCornerShape(26.dp)
 
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
             .testTag("studio_telemetry_list"),
-        contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 196.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        contentPadding = PaddingValues(
+            start = 20.dp,
+            end = 20.dp,
+            top = 6.dp,
+            bottom = 196.dp
+        ),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. Top Nothing Weather-Style Hero Readout + Concise High/Low Status + Capsule Divider
-        item(key = "studio_hero_header") {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 4.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    // Giant circular dot-matrix primary readout (Minutes Spun)
-                    StudioDotMatrixGlyphText(
-                        text = "${snapshot.totalMinutes}M",
-                        dotColor = onCardPrimary,
-                        dotStepDp = 8.2.dp
-                    )
+        // 1. MASTER ACOUSTIC COUNTER + 270° VINYL GROOVE STYLUS GAUGE
+        item(key = "studio_master_counter") {
+            val counterString = remember(counterMode, snapshot) {
+                when (counterMode) {
+                    StudioCounterMode.MINUTES -> {
+                        if (snapshot.totalMinutes >= 600L) {
+                            "${"%.1f".format(snapshot.totalMinutes / 60f)}H"
+                        } else {
+                            "${snapshot.totalMinutes}M"
+                        }
+                    }
+                    StudioCounterMode.SPINS -> "${snapshot.totalPlays}"
+                    StudioCounterMode.ARTISTS -> "${snapshot.uniqueArtistsCount}"
+                }
+            }
 
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text(
-                            text = formatArchetypeTitleCase(snapshot.collectorArchetype),
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                fontWeight = FontWeight.Normal,
-                                fontSize = 18.sp
-                            ),
-                            color = onCardPrimary.copy(alpha = 0.88f)
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
+            val gaugeSweepFraction = remember(counterMode, snapshot) {
+                when (counterMode) {
+                    StudioCounterMode.MINUTES -> (snapshot.totalMinutes / 360f).coerceIn(0.14f, 1f)
+                    StudioCounterMode.SPINS -> (snapshot.totalPlays / 120f).coerceIn(0.14f, 1f)
+                    StudioCounterMode.ARTISTS -> (snapshot.uniqueArtistsCount / 36f).coerceIn(0.14f, 1f)
+                }
+            }
+            val animatedSweep by animateFloatAsState(
+                targetValue = gaugeSweepFraction,
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMediumLow
+                ),
+                label = "studio_gauge_sweep"
+            )
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(cardBg)
+                    .border(0.85.dp, hairline, cardShape)
+                    .padding(20.dp)
+                    .testTag("studio_master_counter_card")
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    // Top Instrument Bar
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = "↓ ",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = coolBlue
-                                )
-                                Text(
-                                    text = "${snapshot.offlinePlays}",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = onCardPrimary
-                                )
-                            }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = "↑ ",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = nothingRed
-                                )
-                                Text(
-                                    text = "${snapshot.streakDays}d",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = onCardPrimary
-                                )
-                            }
+                            val ledColor by animateColorAsState(
+                                targetValue = if (isPlaying) nothingRed else onMutedText.copy(alpha = 0.42f),
+                                animationSpec = tween(280),
+                                label = "studio_led_color"
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(ledColor)
+                            )
+                            Text(
+                                text = if (isPlaying) "SIGNAL LOCKED" else "ATELIER TELEMETRY",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = MonoFontFamily,
+                                    letterSpacing = 1.4.sp
+                                ),
+                                color = if (isPlaying) onPrimaryText else onMutedText
+                            )
                         }
-                    }
-                }
 
-                Spacer(modifier = Modifier.height(14.dp))
-
-                // Sleek Nothing OS dark capsule divider bar
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(11.dp)
-                        .clip(CircleShape)
-                        .background(dividerPillColor)
-                )
-            }
-        }
-
-        // 2. Row 1: Pure-White Contrast Circle (TASTE INDEX) + Stacked 3D Wireframe Dome (Peak Rhythm)
-        item(key = "studio_bento_row_1") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                // Left: Pure White Contrast Circle Card ("TASTE INDEX" + Dot-Matrix Score°)
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .aspectRatio(1f)
-                        .clip(CircleShape)
-                        .background(whiteCircleBg)
-                        .testTag("studio_taste_index_circle"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = "TASTE INDEX",
-                            style = MaterialTheme.typography.labelMedium.copy(
-                                fontFamily = MonoFontFamily,
-                                letterSpacing = 1.1.sp,
-                                fontSize = 11.sp
-                            ),
-                            color = whiteCircleFg.copy(alpha = 0.78f)
-                        )
-                        Spacer(modifier = Modifier.height(10.dp))
-                        StudioDotMatrixGlyphText(
-                            text = "${rawTasteScore}°",
-                            dotColor = whiteCircleFg,
-                            dotStepDp = 7.2.dp
-                        )
-                    }
-                }
-
-                // Right: Dark Square Card — Peak Rhythm + 3D Concentric Wireframe Dome
-                StudioSquareBentoCard(
-                    title = "Peak rhythm",
-                    subtitle = "%02d:00 · %s".format(snapshot.peakHour, peakPhaseLabel),
-                    containerColor = cardBg,
-                    titleColor = onCardPrimary,
-                    subtitleColor = onCardSecondary,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    WireframeDomeGraphic(
-                        activeRatio = ((snapshot.hourlyMatrix.maxOrNull() ?: 0.35f)).coerceIn(0.2f, 1f),
-                        strokeColor = onCardPrimary
-                    )
-                }
-            }
-        }
-
-        // 3. Row 2: 24h Spin Density (Dot-Matrix Grid) + Sonic Breadth (Radar Cone with Red Arc)
-        item(key = "studio_bento_row_2") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                StudioSquareBentoCard(
-                    title = "Spin density",
-                    subtitle = "${snapshot.totalPlays} · ${if (snapshot.totalPlays >= 25) "Heavy" else "Active"}",
-                    containerColor = cardBg,
-                    titleColor = onCardPrimary,
-                    subtitleColor = onCardSecondary,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    DotDensityFieldGraphic(
-                        hourlyMatrix = snapshot.hourlyMatrix,
-                        totalPlays = snapshot.totalPlays,
-                        dotColor = onCardPrimary
-                    )
-                }
-
-                StudioSquareBentoCard(
-                    title = "Sonic breadth",
-                    subtitle = "${snapshot.uniqueArtistsCount} · $tasteCharacter",
-                    containerColor = cardBg,
-                    titleColor = onCardPrimary,
-                    subtitleColor = onCardSecondary,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    RadarBreadthConeGraphic(
-                        artistCount = snapshot.uniqueArtistsCount,
-                        lineColor = onCardPrimary,
-                        accentRed = nothingRed
-                    )
-                }
-            }
-        }
-
-        // 4. Row 3: Taste Vector (Compass Dial with Red N) + Offline Vault (3D Wireframe Cylinder)
-        item(key = "studio_bento_row_3") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                val primaryArtistName = snapshot.topArtists.firstOrNull()?.name ?: tasteCharacter
-                StudioSquareBentoCard(
-                    title = "Taste vector",
-                    subtitle = primaryArtistName,
-                    containerColor = cardBg,
-                    titleColor = onCardPrimary,
-                    subtitleColor = onCardSecondary,
-                    onClick = snapshot.topArtists.firstOrNull()?.let { art -> { onOpenArtist(art.name) } },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    CompassVectorDialGraphic(
-                        angleDeg = dominantDirectionDeg,
-                        ringColor = onCardPrimary,
-                        accentRed = nothingRed
-                    )
-                }
-
-                val offlinePct = if (snapshot.totalPlays > 0) {
-                    ((snapshot.offlinePlays * 100) / snapshot.totalPlays).coerceIn(0, 100)
-                } else if (snapshot.downloadedTracksCount > 0) {
-                    100
-                } else {
-                    0
-                }
-                StudioSquareBentoCard(
-                    title = "Offline vault",
-                    subtitle = "${snapshot.downloadedTracksCount} saved · $offlinePct%",
-                    containerColor = cardBg,
-                    titleColor = onCardPrimary,
-                    subtitleColor = onCardSecondary,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    WireframeCylinderGaugeGraphic(
-                        fillFraction = (snapshot.downloadedTracksCount / 20f).coerceIn(0.18f, 0.88f),
-                        strokeColor = onCardPrimary
-                    )
-                }
-            }
-        }
-
-        // 5. Row 4: Dark Scrobbler Dial Circle (1013.0 Barometer Style) + Top Artists & Circadian Arc
-        item(key = "studio_bento_row_4") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                val isScrobblerLinked = scrobblerState.lastFmConnected || scrobblerState.listenBrainzConnected
-                val dialNumeric = maxOf(snapshot.totalPlays, scrobblerState.remotePlayCount).toString()
-
-                // Left: Dark Circle Dial Card (tappable to manage or sync Last.fm / ListenBrainz)
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .aspectRatio(1f)
-                        .clip(CircleShape)
-                        .background(cardBg)
-                        .clickable {
-                            if (isScrobblerLinked) onSyncScrobblerNow() else showScrobblerSheet = true
-                        }
-                        .padding(18.dp)
-                        .testTag("studio_scrobbler_dial_circle")
-                ) {
-                    // Perimeter calibration dots + top white beacon circle
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val cx = size.width / 2f
-                        val cy = size.height / 2f
-                        val r = size.minDimension * 0.42f
-                        for (tick in 0 until 12) {
-                            val rad = (tick * 30.0 - 90.0) * (PI / 180.0)
-                            val px = cx + cos(rad).toFloat() * r
-                            val py = cy + sin(rad).toFloat() * r
-                            if (tick == 0) {
-                                drawCircle(
-                                    color = if (isScrobblerLinked) nothingRed else onCardPrimary,
-                                    radius = 9.dp.toPx(),
-                                    center = Offset(px, py)
-                                )
+                            text = if (snapshot.streakDays > 0) {
+                                "${"%02d".format(snapshot.streakDays)}D STREAK"
                             } else {
-                                drawCircle(
-                                    color = onCardPrimary.copy(alpha = 0.20f),
-                                    radius = 1.8.dp.toPx(),
-                                    center = Offset(px, py)
-                                )
-                            }
-                        }
-                    }
-
-                    Column(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 14.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        StudioDotMatrixGlyphText(
-                            text = dialNumeric,
-                            dotColor = onCardPrimary,
-                            dotStepDp = 3.8.dp
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = when {
-                                scrobblerState.lastFmConnected -> "LAST.FM SYNC"
-                                scrobblerState.listenBrainzConnected -> "LBRAINZ SYNC"
-                                spotifyProfile.isConnected -> "SPOTIFY SYNC"
-                                else -> "TAP TO SYNC"
+                                "SESSION 01"
                             },
                             style = MaterialTheme.typography.labelSmall.copy(
                                 fontFamily = MonoFontFamily,
-                                fontSize = 9.sp,
-                                letterSpacing = 1.sp
+                                letterSpacing = 1.1.sp
                             ),
-                            color = onCardSecondary,
-                            modifier = Modifier.clickable { showScrobblerSheet = true }
+                            color = onMutedText
+                        )
+                    }
+
+                    // Asymmetric Split: Dot-Matrix Readout (Left) + 270° Vinyl Groove Gauge (Right)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            StudioDotMatrixGlyphText(
+                                text = counterString.take(6),
+                                dotColor = onPrimaryText,
+                                dotStepDp = 6.6.dp
+                            )
+
+                            Text(
+                                text = formatArchetypeTitleCase(snapshot.collectorArchetype),
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = onPrimaryText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+
+                            val subReadout = remember(counterMode, snapshot, spotifyProfile.isConnected) {
+                                val srcBadge = if (spotifyProfile.isConnected) "SPOTIFY + LOCAL" else "LOCAL VAULT"
+                                when (counterMode) {
+                                    StudioCounterMode.MINUTES -> "${snapshot.totalPlays} spins · $srcBadge"
+                                    StudioCounterMode.SPINS -> "${snapshot.offlinePlays} offline · ${snapshot.totalMinutes}m total"
+                                    StudioCounterMode.ARTISTS -> "Peak ${"%02d:00".format(snapshot.peakHour)} · $srcBadge"
+                                }
+                            }
+                            Text(
+                                text = subReadout,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = MonoFontFamily,
+                                    letterSpacing = 0.6.sp
+                                ),
+                                color = onMutedText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(12.dp))
+
+                        StudioVinylStylusGauge(
+                            progress = animatedSweep,
+                            isPlaying = isPlaying,
+                            primaryColor = onPrimaryText,
+                            mutedColor = onMutedText,
+                            accentRed = nothingRed,
+                            centerCode = when (counterMode) {
+                                StudioCounterMode.MINUTES -> "MIN"
+                                StudioCounterMode.SPINS -> "RPM"
+                                StudioCounterMode.ARTISTS -> "CAT"
+                            },
+                            modifier = Modifier.size(104.dp)
+                        )
+                    }
+
+                    // Minimalist Segmented Mode Capsule
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(CircleShape)
+                            .background(cardElevatedBg)
+                            .padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        StudioCounterMode.entries.forEach { mode ->
+                            val selected = counterMode == mode
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .minimumInteractiveComponentSize()
+                                    .clip(CircleShape)
+                                    .background(if (selected) highContrastPillBg else Color.Transparent)
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = ripple(bounded = true),
+                                        onClick = {
+                                            if (counterMode != mode) {
+                                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                counterMode = mode
+                                            }
+                                        }
+                                    )
+                                    .padding(vertical = 8.dp)
+                                    .testTag("studio_counter_mode_${mode.name}"),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = mode.label,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = MonoFontFamily,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                        letterSpacing = 1.0.sp
+                                    ),
+                                    color = if (selected) highContrastPillFg else onMutedText
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 24H MIRRORED ACOUSTIC HORIZON (TOUCH-SCRUBBABLE OSCILLOSCOPE WAVEFORM)
+        item(key = "studio_circadian_horizon") {
+            val safeHour = inspectedHour.coerceIn(0, 23)
+            val rawDensity = snapshot.hourlyMatrix.getOrElse(safeHour) { 0f }
+            val hourDensityPct = (rawDensity * 100f).toInt().coerceIn(0, 100)
+            val exactHourPlays = snapshot.hourlyPlayCounts.getOrElse(safeHour) { 0 }
+            val phaseLabel = remember(safeHour) {
+                when (safeHour) {
+                    in 0..4 -> "AFTER HOURS"
+                    in 5..10 -> "MORNING DRIFT"
+                    in 11..16 -> "DAYLIGHT FOCUS"
+                    in 17..20 -> "DUSK WARMUP"
+                    else -> "NOCTURNAL PEAK"
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(cardBg)
+                    .border(0.85.dp, hairline, cardShape)
+                    .padding(20.dp)
+                    .testTag("studio_circadian_card"),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "24H ACOUSTIC HORIZON",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = MonoFontFamily,
+                                letterSpacing = 1.3.sp
+                            ),
+                            color = onMutedText
+                        )
+                        Text(
+                            text = "${"%02d:00".format(safeHour)} · $phaseLabel",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = onPrimaryText
+                        )
+                    }
+
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(
+                            text = if (exactHourPlays > 0) "$exactHourPlays SPINS" else "$hourDensityPct% LOAD",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontFamily = MonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.9.sp
+                            ),
+                            color = if (safeHour == snapshot.peakHour) nothingRed else onPrimaryText
+                        )
+                        Text(
+                            text = "PEAK ${"%02d:00".format(snapshot.peakHour)}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                            color = onMutedText.copy(alpha = 0.72f)
                         )
                     }
                 }
 
-                // Right: Circadian Horizon & Top Artists Profile Card (pure stats, zero songs/playlists)
-                val hoursListened = snapshot.totalMinutes / 60L
-                val remMins = snapshot.totalMinutes % 60L
-                val spanText = if (hoursListened > 0L) {
-                    "${hoursListened} hr ${remMins} min · $peakPhaseLabel"
-                } else {
-                    "${remMins} min · $peakPhaseLabel"
-                }
-                StudioSquareBentoCard(
-                    title = "Top artists",
-                    subtitle = spanText,
-                    containerColor = cardBg,
-                    titleColor = onCardPrimary,
-                    subtitleColor = onCardSecondary,
-                    modifier = Modifier.weight(1f)
+                // Symmetrical Mirrored Dot-Matrix Soundwave Scrub Surface
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(106.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(cardElevatedBg.copy(alpha = 0.55f))
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                down.consume()
+                                val w = size.width.coerceAtLeast(1)
+                                var currentBucket = ((down.position.x / w) * 24f).toInt().coerceIn(0, 23)
+                                if (currentBucket != inspectedHour) {
+                                    inspectedHour = currentBucket
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                }
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val ptr = event.changes.firstOrNull() ?: break
+                                    if (ptr.pressed) {
+                                        ptr.consume()
+                                        val nextBucket = ((ptr.position.x / w) * 24f).toInt().coerceIn(0, 23)
+                                        if (nextBucket != currentBucket) {
+                                            currentBucket = nextBucket
+                                            inspectedHour = nextBucket
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        }
+                                    }
+                                } while (event.changes.any { it.pressed })
+                            }
+                        }
+                        .padding(horizontal = 10.dp, vertical = 12.dp)
+                        .testTag("studio_circadian_canvas")
                 ) {
-                    TopArtistsAndHorizonGraphic(
-                        topArtists = snapshot.topArtists.take(3),
-                        onOpenArtist = onOpenArtist,
-                        primaryColor = onCardPrimary,
-                        secondaryColor = onCardSecondary,
-                        accentRed = nothingRed
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val cols = 24
+                        val halfPairs = 4 // 1 center dot + 4 mirrored pairs = 9 vertical dots max
+                        val colStep = size.width / cols
+                        val midY = size.height * 0.5f
+                        val rowSpacing = (size.height * 0.44f) / halfPairs
+
+                        // Subtle center horizon hairline
+                        drawLine(
+                            color = onMutedText.copy(alpha = 0.14f),
+                            start = Offset(0f, midY),
+                            end = Offset(size.width, midY),
+                            strokeWidth = 0.8.dp.toPx()
+                        )
+
+                        for (h in 0 until cols) {
+                            val cx = h * colStep + colStep * 0.5f
+                            val rawVal = snapshot.hourlyMatrix.getOrElse(h) { 0f }
+                            // Subtle rhythmic baseline when user has zero plays yet so Studio still looks alive
+                            val effectiveVal = if (snapshot.totalPlays == 0) {
+                                val synth = 0.16f + 0.42f * sin((h / 23f) * PI.toFloat()).coerceAtLeast(0f)
+                                if (h in 20..23) (synth + 0.28f).coerceAtMost(0.92f) else synth
+                            } else {
+                                rawVal
+                            }
+                            val activePairs = (effectiveVal * halfPairs).toInt().coerceIn(0, halfPairs)
+                            val isSelected = h == safeHour
+                            val isPeak = h == snapshot.peakHour
+
+                            if (isSelected) {
+                                drawLine(
+                                    color = nothingRed.copy(alpha = 0.42f),
+                                    start = Offset(cx, 0f),
+                                    end = Offset(cx, size.height),
+                                    strokeWidth = 1.dp.toPx()
+                                )
+                            }
+
+                            for (pair in -halfPairs..halfPairs) {
+                                val dist = kotlin.math.abs(pair)
+                                val isLit = dist <= activePairs && (dist == 0 || effectiveVal > 0.05f)
+                                val cy = midY + pair * rowSpacing
+                                val dotColor = when {
+                                    isLit && isSelected -> nothingRed
+                                    isLit && isPeak -> nothingRed.copy(alpha = 0.86f)
+                                    isLit -> onPrimaryText.copy(alpha = 0.88f - dist * 0.08f)
+                                    isSelected -> onPrimaryText.copy(alpha = 0.26f)
+                                    else -> onMutedText.copy(alpha = 0.12f)
+                                }
+                                val r = when {
+                                    isLit && isSelected -> 2.75.dp.toPx()
+                                    isLit -> 2.25.dp.toPx()
+                                    else -> 1.35.dp.toPx()
+                                }
+                                drawCircle(
+                                    color = dotColor,
+                                    radius = r,
+                                    center = Offset(cx, cy)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    listOf("00", "06", "12", "18", "23").forEach { tick ->
+                        Text(
+                            text = "$tick:00",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = MonoFontFamily,
+                                letterSpacing = 0.6.sp
+                            ),
+                            color = onMutedText.copy(alpha = 0.68f)
+                        )
+                    }
+                }
+            }
+        }
+
+        // 3. 5-AXIS SONIC DNA POLAR MATRIX + HARDWARE TELEMETRY STRIP (NO SPEED CONTROLS)
+        item(key = "studio_sonic_dna") {
+            val axes = remember(snapshot) {
+                listOf(
+                    "NOCTURNAL" to (snapshot.nightSharePercent / 100f).coerceIn(0.15f, 1f),
+                    "LOYALTY" to (snapshot.replayLoyaltyPercent / 100f).coerceIn(0.15f, 1f),
+                    "IMMERSION" to (snapshot.immersionScorePercent / 100f).coerceIn(0.15f, 1f),
+                    "VAULT" to (snapshot.vaultAutonomyPercent / 100f).coerceIn(0.15f, 1f),
+                    "CADENCE" to (snapshot.cadenceConsistencyPercent / 100f).coerceIn(0.15f, 1f)
+                )
+            }
+            val avgMin = snapshot.avgTrackDurationSec / 60
+            val avgRemSec = snapshot.avgTrackDurationSec % 60
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(cardBg)
+                    .border(0.85.dp, hairline, cardShape)
+                    .padding(20.dp)
+                    .testTag("studio_sonic_dna_card"),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "SONIC DNA GEOMETRY",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = MonoFontFamily,
+                                letterSpacing = 1.3.sp
+                            ),
+                            color = onMutedText
+                        )
+                        Text(
+                            text = "Taste Signature",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = onPrimaryText
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .clip(CircleShape)
+                            .background(cardElevatedBg)
+                            .border(0.75.dp, hairline, CircleShape)
+                            .clickable(onClick = onOpenEqualizer)
+                            .padding(horizontal = 12.dp, vertical = 7.dp)
+                            .testTag("studio_open_dsp_eq_button"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Equalizer,
+                            contentDescription = "Open System Equalizer",
+                            tint = onPrimaryText,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Text(
+                            text = "SYSTEM EQ",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = MonoFontFamily,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.8.sp
+                            ),
+                            color = onPrimaryText
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    SonicDnaPolarRadar(
+                        axes = axes,
+                        primaryColor = onPrimaryText,
+                        mutedColor = onMutedText,
+                        accentRed = nothingRed,
+                        modifier = Modifier.size(138.dp)
+                    )
+
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        axes.forEachIndexed { idx, (label, fraction) ->
+                            val pct = (fraction * 100f).toInt()
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(5.dp)
+                                            .clip(CircleShape)
+                                            .background(if (idx == 0) nothingRed else onPrimaryText.copy(alpha = 0.68f))
+                                    )
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontFamily = MonoFontFamily,
+                                            letterSpacing = 0.9.sp
+                                        ),
+                                        color = onMutedText
+                                    )
+                                }
+                                Text(
+                                    text = "$pct%",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = MonoFontFamily,
+                                        fontWeight = FontWeight.Bold
+                                    ),
+                                    color = onPrimaryText
+                                )
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(thickness = 0.75.dp, color = hairline)
+
+                // Clean 3-column hardware telemetry footer
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    StudioMiniStatCell(
+                        label = "AVG CUT",
+                        value = "%d:%02d".format(avgMin, avgRemSec),
+                        primaryColor = onPrimaryText,
+                        mutedColor = onMutedText,
+                        modifier = Modifier.weight(1f)
+                    )
+                    VerticalDivider(modifier = Modifier.height(26.dp), thickness = 0.75.dp, color = hairline)
+                    StudioMiniStatCell(
+                        label = "SAVED CRATE",
+                        value = "${snapshot.savedTracksCount + snapshot.downloadedTracksCount}",
+                        primaryColor = onPrimaryText,
+                        mutedColor = onMutedText,
+                        modifier = Modifier.weight(1f)
+                    )
+                    VerticalDivider(modifier = Modifier.height(26.dp), thickness = 0.75.dp, color = hairline)
+                    StudioMiniStatCell(
+                        label = "OFFLINE VAULT",
+                        value = "${snapshot.downloadedTracksCount} LP",
+                        primaryColor = onPrimaryText,
+                        mutedColor = onMutedText,
+                        modifier = Modifier.weight(1f)
                     )
                 }
             }
         }
-    }
-}
 
-@Composable
-private fun StudioSquareBentoCard(
-    title: String,
-    subtitle: String,
-    containerColor: Color,
-    titleColor: Color,
-    subtitleColor: Color,
-    modifier: Modifier = Modifier,
-    onClick: (() -> Unit)? = null,
-    graphicContent: @Composable () -> Unit
-) {
-    val clickMod = if (onClick != null) {
-        Modifier.clickable(onClick = onClick)
-    } else {
-        Modifier
-    }
-    Column(
-        modifier = modifier
-            .aspectRatio(1f)
-            .clip(RoundedCornerShape(26.dp))
-            .background(containerColor)
-            .then(clickMod)
-            .padding(16.dp),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium.copy(
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 16.sp
-                ),
-                color = titleColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
-                color = subtitleColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+        // 4. HEAVY ROTATION PRESSINGS + #1 CROWN CUT
+        item(key = "studio_heavy_rotation_rack") {
+            val maxArtistPlays = (snapshot.topArtists.maxOfOrNull { it.playCount } ?: 1).coerceAtLeast(1)
+            val totalTopPlays = snapshot.topArtists.sumOf { it.playCount }.coerceAtLeast(1)
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(cardBg)
+                    .border(0.85.dp, hairline, cardShape)
+                    .padding(20.dp)
+                    .testTag("studio_top_artists_card"),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "HEAVY ROTATION",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = MonoFontFamily,
+                            letterSpacing = 1.3.sp
+                        ),
+                        color = onMutedText
+                    )
+                    Text(
+                        text = "INDEX 01—0${snapshot.topArtists.size.coerceIn(1, 5)}",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                        color = onMutedText
+                    )
+                }
+
+                if (snapshot.topArtists.isNotEmpty()) {
+                    snapshot.topArtists.take(5).forEachIndexed { idx, artist ->
+                        val sharePct = ((artist.playCount.toFloat() / totalTopPlays.toFloat()) * 100f)
+                            .toInt()
+                            .coerceIn(1, 100)
+                        ArtistTelemetryBarRow(
+                            rank = idx + 1,
+                            artist = artist,
+                            sharePct = sharePct,
+                            fraction = (artist.playCount.toFloat() / maxArtistPlays.toFloat()).coerceIn(0.12f, 1f),
+                            isLead = idx == 0,
+                            primaryColor = onPrimaryText,
+                            mutedColor = onMutedText,
+                            surfaceBg = cardElevatedBg,
+                            accentRed = nothingRed,
+                            onClick = { onOpenArtist(artist.name) }
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "Spin records or link Spotify / Last.fm to calibrate your rotation index.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = onMutedText
+                    )
+                }
+
+                snapshot.topTrack?.let { crown ->
+                    val context = LocalContext.current
+                    val artReq = remember(crown.artworkUrl) {
+                        ImageRequest.Builder(context)
+                            .data(crown.artworkUrl)
+                            .crossfade(140)
+                            .size(120)
+                            .build()
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(cardElevatedBg)
+                            .border(0.75.dp, hairline, RoundedCornerShape(18.dp))
+                            .clickable { onPlayTopTrack(crown) }
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                            .testTag("studio_crown_track_row"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(cardBg),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (crown.artworkUrl.isNotBlank()) {
+                                AsyncImage(
+                                    model = artReq,
+                                    contentDescription = crown.title,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Filled.GraphicEq,
+                                    contentDescription = null,
+                                    tint = nothingRed,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "CROWN CUT · ${snapshot.topTrackPlays} SPINS",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = MonoFontFamily,
+                                    letterSpacing = 1.0.sp
+                                ),
+                                color = nothingRed
+                            )
+                            NothingSlowMarqueeText(
+                                text = "${crown.title} — ${crown.artist}",
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = onPrimaryText,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .background(highContrastPillBg),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PlayArrow,
+                                contentDescription = "Play most spun track",
+                                tint = highContrastPillFg,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
         }
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(top = 8.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            graphicContent()
-        }
-    }
-}
+        // 5. SCROBBLER TELEMETRY BRIDGE (LAST.FM & LISTENBRAINZ)
+        item(key = "studio_scrobbler_patchbay") {
+            val isLinked = scrobblerState.lastFmConnected || scrobblerState.listenBrainzConnected
+            val providerTitle = when {
+                scrobblerState.lastFmConnected -> "Last.fm · @${scrobblerState.lastFmUsername}"
+                scrobblerState.listenBrainzConnected -> "ListenBrainz · @${scrobblerState.listenBrainzUsername}"
+                else -> "Last.fm / ListenBrainz Standby"
+            }
 
-/**
- * Stacked 3D concentric dome wireframe ellipses (inspired by Nothing OS UV Index card).
- */
-@Composable
-private fun WireframeDomeGraphic(
-    activeRatio: Float,
-    strokeColor: Color
-) {
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val cx = size.width / 2f
-        val baseW = size.width * 0.64f
-        val baseH = baseW * 0.16f
-        val bottomY = size.height * 0.86f
-        val layers = 6
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(cardBg)
+                    .border(0.85.dp, hairline, cardShape)
+                    .padding(20.dp)
+                    .testTag("studio_scrobbler_patchbay_card"),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(if (isLinked) nothingRed else onMutedText.copy(alpha = 0.38f))
+                        )
+                        Text(
+                            text = "SCROBBLER BRIDGE",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = MonoFontFamily,
+                                letterSpacing = 1.3.sp
+                            ),
+                            color = onMutedText
+                        )
+                    }
 
-        // Crisp bright base ellipse ring
-        drawOval(
-            color = strokeColor.copy(alpha = 0.88f),
-            topLeft = Offset(cx - baseW / 2f, bottomY - baseH / 2f),
-            size = Size(baseW, baseH),
-            style = Stroke(width = 1.4.dp.toPx())
-        )
+                    Text(
+                        text = if (scrobblerState.pendingOfflineScrobbles > 0) {
+                            "${scrobblerState.pendingOfflineScrobbles} QUEUED"
+                        } else if (isLinked) {
+                            "LIVE 2-WAY"
+                        } else {
+                            "OFFLINE"
+                        },
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                        color = if (isLinked) onPrimaryText else onMutedText
+                    )
+                }
 
-        // Concentric 3D dome arches rising above the base ring
-        for (i in 1..layers) {
-            val frac = i.toFloat() / layers.toFloat()
-            val archHeight = size.height * (0.20f + frac * 0.56f)
-            val alpha = (0.14f + (1f - frac) * 0.16f + activeRatio * 0.08f).coerceIn(0.10f, 0.42f)
-            drawOval(
-                color = strokeColor.copy(alpha = alpha),
-                topLeft = Offset(cx - baseW / 2f, bottomY - archHeight),
-                size = Size(baseW, archHeight + baseH * 0.45f),
-                style = Stroke(width = 1.dp.toPx())
-            )
-        }
-    }
-}
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        text = providerTitle,
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                        color = onPrimaryText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (isLinked) {
+                            "${scrobblerState.remotePlayCount} remote scrobbles · Offline queue enabled"
+                        } else {
+                            "Connect Last.fm or ListenBrainz for automatic cross-device scrobbling"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = onMutedText
+                    )
+                }
 
-/**
- * Staggered 10x6 dot-matrix density field (bright left columns transitioning to dim right columns,
- * directly modeled on Nothing OS Air Quality dot field).
- */
-@Composable
-private fun DotDensityFieldGraphic(
-    hourlyMatrix: List<Float>,
-    totalPlays: Int,
-    dotColor: Color
-) {
-    val activeHoursCount = hourlyMatrix.count { it > 0.05f }
-    val litColumns = when {
-        totalPlays == 0 -> 4
-        else -> (2 + (activeHoursCount * 10) / 16).coerceIn(2, 10)
-    }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .clip(CircleShape)
+                            .background(highContrastPillBg)
+                            .clickable { showScrobblerSheet = true }
+                            .padding(vertical = 11.dp)
+                            .testTag("studio_scrobbler_dial_circle"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = if (isLinked) "CONFIGURE SCROBBLER" else "CONNECT SCROBBLER",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontFamily = MonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.8.sp
+                            ),
+                            color = highContrastPillFg
+                        )
+                    }
 
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val cols = 10
-        val rows = 6
-        val padX = 4.dp.toPx()
-        val padY = 6.dp.toPx()
-        val stepX = (size.width - padX * 2f) / (cols - 1).coerceAtLeast(1)
-        val stepY = (size.height - padY * 2f) / (rows - 1).coerceAtLeast(1)
-        val r = 2.1.dp.toPx()
-
-        for (c in 0 until cols) {
-            val isLit = c < litColumns
-            val staggerY = if (c % 2 == 1) stepY * 0.28f else 0f
-            for (row in 0 until rows) {
-                val py = (padY + row * stepY + staggerY).coerceAtMost(size.height - r)
-                val px = padX + c * stepX
-                drawCircle(
-                    color = dotColor.copy(alpha = if (isLit) 0.92f else 0.16f),
-                    radius = r,
-                    center = Offset(px, py)
-                )
+                    if (isLinked) {
+                        Row(
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .clip(CircleShape)
+                                .background(cardElevatedBg)
+                                .border(0.85.dp, hairline, CircleShape)
+                                .clickable { onSyncScrobblerNow() }
+                                .padding(horizontal = 16.dp, vertical = 11.dp)
+                                .testTag("studio_scrobbler_sync_now"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Sync,
+                                contentDescription = "Sync scrobbles now",
+                                tint = onPrimaryText,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = if (scrobblerState.isSyncing) "SYNCING…" else "SYNC",
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontFamily = MonoFontFamily,
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = onPrimaryText
+                            )
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-/**
- * Angular radar cone beam with concentric range arcs and surgical Nothing Red active arc
- * (modeled directly on Nothing OS Visibility card).
- */
 @Composable
-private fun RadarBreadthConeGraphic(
-    artistCount: Int,
-    lineColor: Color,
-    accentRed: Color
+private fun StudioVinylStylusGauge(
+    progress: Float,
+    isPlaying: Boolean,
+    primaryColor: Color,
+    mutedColor: Color,
+    accentRed: Color,
+    centerCode: String,
+    modifier: Modifier = Modifier
 ) {
-    val activeArcIdx = when {
-        artistCount >= 14 -> 3
-        artistCount >= 6 -> 2
-        else -> 1
-    }
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val center = Offset(size.width * 0.5f, size.height * 0.5f)
+            val outerR = size.minDimension * 0.46f
+            val innerGrooveR = outerR * 0.72f
+            val totalTicks = 28
+            val startDeg = 135f
+            val sweepDeg = 270f
+            val litTicks = (progress * totalTicks).toInt().coerceIn(2, totalTicks)
 
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val apex = Offset(size.width * 0.08f, size.height * 0.56f)
-        val maxLen = size.width * 0.84f
-        val halfSpreadDeg = 17f
-        val topRad = (-halfSpreadDeg * PI / 180.0).toFloat()
-        val botRad = (halfSpreadDeg * PI / 180.0).toFloat()
+            // Outer 270-degree dot-matrix calibration ring
+            for (i in 0 until totalTicks) {
+                val deg = startDeg + (i.toFloat() / (totalTicks - 1).toFloat()) * sweepDeg
+                val rad = (deg * PI / 180.0).toFloat()
+                val px = center.x + cos(rad) * outerR
+                val py = center.y + sin(rad) * outerR
+                val isLit = i < litTicks
+                val isTip = i == litTicks - 1
+                drawCircle(
+                    color = when {
+                        isTip -> accentRed
+                        isLit -> primaryColor.copy(alpha = 0.88f)
+                        else -> mutedColor.copy(alpha = 0.16f)
+                    },
+                    radius = if (isTip) 2.8.dp.toPx() else 1.75.dp.toPx(),
+                    center = Offset(px, py)
+                )
+            }
 
-        val topEnd = Offset(apex.x + cos(topRad) * maxLen, apex.y + sin(topRad) * maxLen)
-        val botEnd = Offset(apex.x + cos(botRad) * maxLen, apex.y + sin(botRad) * maxLen)
-
-        val conePath = Path().apply {
-            moveTo(botEnd.x, botEnd.y)
-            lineTo(apex.x, apex.y)
-            lineTo(topEnd.x, topEnd.y)
-        }
-        drawPath(
-            path = conePath,
-            color = lineColor.copy(alpha = 0.88f),
-            style = Stroke(width = 1.35.dp.toPx(), cap = StrokeCap.Round)
-        )
-
-        for (arcIdx in 1..3) {
-            val radius = maxLen * (0.48f + (arcIdx - 1) * 0.21f)
-            drawArc(
-                color = if (arcIdx == activeArcIdx) accentRed else lineColor.copy(alpha = 0.72f),
-                startAngle = -halfSpreadDeg,
-                sweepAngle = halfSpreadDeg * 2f,
-                useCenter = false,
-                topLeft = Offset(apex.x - radius, apex.y - radius),
-                size = Size(radius * 2f, radius * 2f),
-                style = Stroke(width = 1.4.dp.toPx(), cap = StrokeCap.Round)
-            )
-        }
-    }
-}
-
-/**
- * Minimalist circular compass dial with Nothing Red `N` marker and directional needle tick
- * (modeled directly on Nothing OS Wind Speed card).
- */
-@Composable
-private fun CompassVectorDialGraphic(
-    angleDeg: Float,
-    ringColor: Color,
-    accentRed: Color
-) {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(
-            text = "N",
-            style = MaterialTheme.typography.labelSmall.copy(
-                fontFamily = MonoFontFamily,
-                fontSize = 9.sp,
-                fontWeight = FontWeight.Bold
-            ),
-            color = accentRed,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 2.dp)
-        )
-
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(top = 14.dp, bottom = 4.dp)
-        ) {
-            val cx = size.width / 2f
-            val cy = size.height / 2f
-            val r = minOf(size.width, size.height) * 0.44f
-
+            // Inner micro-groove ring
             drawCircle(
-                color = ringColor.copy(alpha = 0.88f),
-                radius = r,
-                center = Offset(cx, cy),
-                style = Stroke(width = 1.35.dp.toPx())
+                color = mutedColor.copy(alpha = 0.16f),
+                radius = innerGrooveR,
+                center = center,
+                style = Stroke(width = 0.9.dp.toPx())
             )
 
-            // Red North reference tick inside top rim
-            drawLine(
-                color = accentRed,
-                start = Offset(cx, cy - r),
-                end = Offset(cx, cy - r + 7.dp.toPx()),
-                strokeWidth = 1.5.dp.toPx(),
-                cap = StrokeCap.Round
+            // Precision stylus needle pointing to active tick
+            val needleDeg = startDeg + progress.coerceIn(0f, 1f) * sweepDeg
+            val needleRad = (needleDeg * PI / 180.0).toFloat()
+            val needleStart = Offset(
+                center.x + cos(needleRad) * (innerGrooveR * 0.48f),
+                center.y + sin(needleRad) * (innerGrooveR * 0.48f)
             )
-
-            // Active taste vector pointer tick
-            val rad = ((angleDeg - 90f) * PI / 180.0).toFloat()
+            val needleEnd = Offset(
+                center.x + cos(needleRad) * (outerR * 0.88f),
+                center.y + sin(needleRad) * (outerR * 0.88f)
+            )
             drawLine(
-                color = ringColor,
-                start = Offset(cx + cos(rad) * (r * 0.68f), cy + sin(rad) * (r * 0.68f)),
-                end = Offset(cx + cos(rad) * r, cy + sin(rad) * r),
+                color = if (isPlaying) accentRed else primaryColor.copy(alpha = 0.72f),
+                start = needleStart,
+                end = needleEnd,
                 strokeWidth = 1.6.dp.toPx(),
                 cap = StrokeCap.Round
             )
         }
-    }
-}
 
-/**
- * 3D wireframe cylinder level gauge (modeled directly on Nothing OS Humidity card).
- */
-@Composable
-private fun WireframeCylinderGaugeGraphic(
-    fillFraction: Float,
-    strokeColor: Color
-) {
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val cylW = size.width * 0.56f
-        val ellipseH = cylW * 0.24f
-        val left = (size.width - cylW) / 2f
-        val right = left + cylW
-        val topCenterY = size.height * 0.18f
-        val botCenterY = size.height * 0.82f
-
-        // Vertical cylinder walls
-        drawLine(
-            color = strokeColor.copy(alpha = 0.86f),
-            start = Offset(left, topCenterY),
-            end = Offset(left, botCenterY),
-            strokeWidth = 1.25.dp.toPx()
-        )
-        drawLine(
-            color = strokeColor.copy(alpha = 0.86f),
-            start = Offset(right, topCenterY),
-            end = Offset(right, botCenterY),
-            strokeWidth = 1.25.dp.toPx()
-        )
-
-        // Top & bottom ellipses
-        drawOval(
-            color = strokeColor.copy(alpha = 0.88f),
-            topLeft = Offset(left, topCenterY - ellipseH / 2f),
-            size = Size(cylW, ellipseH),
-            style = Stroke(width = 1.25.dp.toPx())
-        )
-        drawOval(
-            color = strokeColor.copy(alpha = 0.88f),
-            topLeft = Offset(left, botCenterY - ellipseH / 2f),
-            size = Size(cylW, ellipseH),
-            style = Stroke(width = 1.25.dp.toPx())
-        )
-
-        // Internal fluid level ellipse
-        val levelY = botCenterY - (botCenterY - topCenterY) * fillFraction.coerceIn(0.15f, 0.85f)
-        drawOval(
-            color = strokeColor.copy(alpha = 0.45f),
-            topLeft = Offset(left, levelY - ellipseH / 2f),
-            size = Size(cylW, ellipseH),
-            style = Stroke(width = 1.15.dp.toPx())
+        Text(
+            text = centerCode,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = MonoFontFamily,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.0.sp
+            ),
+            color = mutedColor
         )
     }
 }
 
-/**
- * Pure Artist Taste Profile + Nothing OS Horizon Arc (zero song suggestions, zero playlists).
- */
 @Composable
-private fun TopArtistsAndHorizonGraphic(
-    topArtists: List<ArtistInsightStat>,
-    onOpenArtist: (String) -> Unit,
+private fun SonicDnaPolarRadar(
+    axes: List<Pair<String, Float>>,
     primaryColor: Color,
-    secondaryColor: Color,
-    accentRed: Color
+    mutedColor: Color,
+    accentRed: Color,
+    modifier: Modifier = Modifier
 ) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        if (topArtists.isNotEmpty()) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                topArtists.take(3).forEachIndexed { idx, art ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onOpenArtist(art.name) },
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${idx + 1}. ${art.name}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (idx == 0) primaryColor else primaryColor.copy(alpha = 0.80f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Text(
-                            text = "${art.playCount}",
-                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
-                            color = if (idx == 0) accentRed else secondaryColor
-                        )
-                    }
-                }
+    Canvas(modifier = modifier) {
+        val count = axes.size
+        if (count < 3) return@Canvas
+        val center = Offset(size.width * 0.5f, size.height * 0.5f)
+        val maxR = size.minDimension * 0.44f
+
+        // 3 concentric pentagonal calibration rings
+        for (ring in 1..3) {
+            val r = maxR * (ring / 3f)
+            val ringPath = Path()
+            for (i in 0 until count) {
+                val angle = (-PI / 2.0 + (2.0 * PI * i) / count).toFloat()
+                val px = center.x + cos(angle) * r
+                val py = center.y + sin(angle) * r
+                if (i == 0) ringPath.moveTo(px, py) else ringPath.lineTo(px, py)
             }
-        } else {
-            Text(
-                text = "Spin music to map artist affinity",
-                style = MaterialTheme.typography.labelSmall,
-                color = secondaryColor
+            ringPath.close()
+            drawPath(
+                path = ringPath,
+                color = mutedColor.copy(alpha = if (ring == 3) 0.24f else 0.12f),
+                style = Stroke(width = 0.8.dp.toPx())
             )
         }
 
-        // Clean horizon parabola arc at bottom matching Nothing OS Sunrise & Sunset card
+        // Axis spokes
+        for (i in 0 until count) {
+            val angle = (-PI / 2.0 + (2.0 * PI * i) / count).toFloat()
+            drawLine(
+                color = mutedColor.copy(alpha = 0.16f),
+                start = center,
+                end = Offset(center.x + cos(angle) * maxR, center.y + sin(angle) * maxR),
+                strokeWidth = 0.8.dp.toPx()
+            )
+        }
+
+        // User Taste DNA Polygon
+        val dataPath = Path()
+        val vertices = ArrayList<Offset>(count)
+        axes.forEachIndexed { i, (_, value) ->
+            val clamped = value.coerceIn(0.15f, 1f)
+            val angle = (-PI / 2.0 + (2.0 * PI * i) / count).toFloat()
+            val pt = Offset(
+                center.x + cos(angle) * (maxR * clamped),
+                center.y + sin(angle) * (maxR * clamped)
+            )
+            vertices.add(pt)
+            if (i == 0) dataPath.moveTo(pt.x, pt.y) else dataPath.lineTo(pt.x, pt.y)
+        }
+        dataPath.close()
+
+        drawPath(
+            path = dataPath,
+            color = accentRed.copy(alpha = 0.16f)
+        )
+        drawPath(
+            path = dataPath,
+            color = primaryColor.copy(alpha = 0.86f),
+            style = Stroke(width = 1.4.dp.toPx())
+        )
+
+        vertices.forEachIndexed { idx, pt ->
+            drawCircle(
+                color = if (idx == 0) accentRed else primaryColor,
+                radius = if (idx == 0) 3.2.dp.toPx() else 2.4.dp.toPx(),
+                center = pt
+            )
+        }
+    }
+}
+
+@Composable
+private fun StudioMiniStatCell(
+    label: String,
+    value: String,
+    primaryColor: Color,
+    mutedColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = MonoFontFamily,
+                letterSpacing = 0.9.sp
+            ),
+            color = mutedColor
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleMedium.copy(
+                fontFamily = MonoFontFamily,
+                fontWeight = FontWeight.Bold
+            ),
+            color = primaryColor
+        )
+    }
+}
+
+@Composable
+private fun ArtistTelemetryBarRow(
+    rank: Int,
+    artist: ArtistInsightStat,
+    sharePct: Int,
+    fraction: Float,
+    isLead: Boolean,
+    primaryColor: Color,
+    mutedColor: Color,
+    surfaceBg: Color,
+    accentRed: Color,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 4.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    text = "%02d".format(rank),
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        fontFamily = MonoFontFamily,
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = if (isLead) accentRed else mutedColor
+                )
+
+                // Micro-vinyl artist disc with center spindle hole
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(surfaceBg),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (artist.artworkUrl.isNotBlank()) {
+                        AsyncImage(
+                            model = artist.artworkUrl,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF101013))
+                    )
+                }
+
+                NothingSlowMarqueeText(
+                    text = artist.name,
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = if (isLead) FontWeight.Bold else FontWeight.Medium
+                    ),
+                    color = primaryColor,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                    contentDescription = null,
+                    tint = mutedColor.copy(alpha = 0.55f),
+                    modifier = Modifier.size(13.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            Text(
+                text = "${artist.playCount} SPINS · $sharePct%",
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                color = if (isLead) primaryColor else mutedColor
+            )
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Proportional 24-dot Nothing LED bar
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(26.dp)
+                .height(6.dp)
         ) {
-            val arcW = size.width * 0.68f
-            val arcLeft = (size.width - arcW) / 2f
-            drawArc(
-                color = primaryColor.copy(alpha = 0.86f),
-                startAngle = 195f,
-                sweepAngle = 150f,
-                useCenter = false,
-                topLeft = Offset(arcLeft, 4.dp.toPx()),
-                size = Size(arcW, size.height * 1.9f),
-                style = Stroke(width = 1.4.dp.toPx(), cap = StrokeCap.Round)
-            )
+            val totalDots = 24
+            val litDots = (fraction * totalDots).toInt().coerceIn(1, totalDots)
+            val step = size.width / totalDots
+            for (i in 0 until totalDots) {
+                val lit = i < litDots
+                drawCircle(
+                    color = when {
+                        lit && isLead -> accentRed
+                        lit -> primaryColor.copy(alpha = 0.78f)
+                        else -> mutedColor.copy(alpha = 0.14f)
+                    },
+                    radius = 2.0.dp.toPx(),
+                    center = Offset(i * step + step / 2f, size.height / 2f)
+                )
+            }
         }
     }
 }
 
 /**
- * Custom Circular Dot-Matrix Glyph Renderer for giant Nothing OS numerals (`32°`, `1013.0`, `148M`).
+ * Clean-room Circular Dot-Matrix Glyph Renderer for Nothing OS Studio numerals (`148M`, `42`, `9`).
  */
 private val STUDIO_DOT_GLYPHS: Map<Char, IntArray> = mapOf(
     '0' to intArrayOf(0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110),
@@ -858,8 +1316,7 @@ private val STUDIO_DOT_GLYPHS: Map<Char, IntArray> = mapOf(
     '9' to intArrayOf(0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110),
     'M' to intArrayOf(0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001),
     'H' to intArrayOf(0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001),
-    '.' to intArrayOf(0b000, 0b000, 0b000, 0b000, 0b000, 0b010, 0b010),
-    '°' to intArrayOf(0b010, 0b101, 0b010, 0b000, 0b000, 0b000, 0b000)
+    '.' to intArrayOf(0b000, 0b000, 0b000, 0b000, 0b000, 0b010, 0b010)
 )
 
 @Composable
@@ -872,7 +1329,7 @@ private fun StudioDotMatrixGlyphText(
     val upper = text.uppercase()
     val totalCols = upper.sumOf { ch ->
         when (ch) {
-            '.', '°' -> 4
+            '.' -> 4
             else -> 6
         }
     }.coerceAtLeast(1) - 1
@@ -888,7 +1345,7 @@ private fun StudioDotMatrixGlyphText(
 
         for (ch in upper) {
             val rowsMask = STUDIO_DOT_GLYPHS[ch]
-            val charWidth = if (ch == '.' || ch == '°') 3 else 5
+            val charWidth = if (ch == '.') 3 else 5
             if (rowsMask != null) {
                 for (r in 0 until 7) {
                     val mask = rowsMask[r]
@@ -910,7 +1367,7 @@ private fun StudioDotMatrixGlyphText(
 }
 
 private fun formatArchetypeTitleCase(raw: String): String {
-    if (raw.isBlank()) return "Analog"
+    if (raw.isBlank()) return "Nocturnal Analog"
     return raw.lowercase().split(" ").joinToString(" ") { word ->
         word.replaceFirstChar { it.uppercase() }
     }

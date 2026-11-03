@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.net.toUri
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -25,7 +26,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -35,7 +35,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -63,6 +62,7 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -71,13 +71,24 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Canvas as ComposeCanvas
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.ImageShader
+import androidx.compose.ui.graphics.Paint
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.data.model.GlyphSettings
@@ -91,6 +102,7 @@ import com.example.ui.components.AddToPlaylistSheet
 import com.example.ui.components.FrostedGlassCapsule
 import com.example.ui.components.LocalGlassBackdrop
 import com.example.ui.components.LocalInsideBackdropRecording
+import com.example.ui.components.LocalMarqueePaused
 import com.example.ui.components.NothingCleanHeader
 import com.example.ui.components.NothingFeedbackPill
 import com.example.ui.components.NothingTrackOptionsSheet
@@ -155,7 +167,10 @@ private val DOCK_ITEMS = listOf(
 fun NothingChordApp(viewModel: NothingChordViewModel) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val audioState by viewModel.audioState.collectAsStateWithLifecycle()
+    val bannerAudioState by viewModel.playbackBannerState.collectAsStateWithLifecycle()
+    val unplayableTrackIds by viewModel.unplayableTrackIds.collectAsStateWithLifecycle()
+    val hiddenHomePlaylistKeys by viewModel.hiddenHomePlaylistKeys.collectAsStateWithLifecycle()
+    val userTasteProfile by viewModel.userTasteProfile.collectAsStateWithLifecycle()
     val savedTracks by viewModel.savedTracks.collectAsStateWithLifecycle()
     val savedIds by viewModel.savedTrackIds.collectAsStateWithLifecycle()
     val recentScrobbles by viewModel.recentScrobbles.collectAsStateWithLifecycle()
@@ -173,6 +188,13 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
     val isInitialPrefsLoaded by viewModel.isInitialPrefsLoaded.collectAsStateWithLifecycle()
 
     var editingPlaylistIdFromSheet by remember { mutableStateOf<String?>(null) }
+    var playerDismissedBySwipe by remember { mutableStateOf(false) }
+
+    LaunchedEffect(uiState.isFullPlayerOpen) {
+        if (uiState.isFullPlayerOpen) {
+            playerDismissedBySwipe = false
+        }
+    }
 
     if (!isInitialPrefsLoaded) {
         Box(
@@ -204,7 +226,7 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                 viewModel.launchSpotifyOAuth(clientId, safeLaunchExternalUri)
             },
             onOpenSpotifyDashboard = {
-                safeLaunchExternalUri(Uri.parse("https://developer.spotify.com/dashboard"))
+                safeLaunchExternalUri("https://developer.spotify.com/dashboard".toUri())
             },
             onFinishOnboarding = { viewModel.completeOnboarding() }
         )
@@ -263,9 +285,9 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
         }
     }
 
-    val currentTrackId by remember { derivedStateOf { audioState.currentTrack?.id } }
-    val isPlaying by remember { derivedStateOf { audioState.isPlaying } }
-    val hasActiveTrack by remember { derivedStateOf { audioState.currentTrack != null } }
+    val currentTrackId by remember { derivedStateOf { bannerAudioState.currentTrack?.id } }
+    val isPlaying by remember { derivedStateOf { bannerAudioState.isPlaying } }
+    val hasActiveTrack by remember { derivedStateOf { bannerAudioState.currentTrack != null } }
 
     val previousQueueTrack = remember(uiState.queue, uiState.currentQueueIndex) {
         if (uiState.currentQueueIndex > 0) uiState.queue.getOrNull(uiState.currentQueueIndex - 1) else null
@@ -370,13 +392,14 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
         )
     }
 
-    BoxWithConstraints(
+    val isExpandedLayout = LocalConfiguration.current.screenWidthDp >= 720
+    val isMainStageOccluded = (uiState.isFullPlayerOpen && hasActiveTrack) || uiState.isAccountPageOpen
+
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        val isExpandedLayout = maxWidth >= 720.dp
-
         if (isExpandedLayout) {
             Row(modifier = Modifier.fillMaxSize()) {
                 NavigationRail(
@@ -429,7 +452,11 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                 ExpandedMainStage(
                     headerTitle = stringResource(activeSpec.headerRes),
                     uiState = uiState,
-                    audioState = audioState,
+                    bannerAudioState = bannerAudioState,
+                    isMainStageOccluded = isMainStageOccluded,
+                    unplayableTrackIds = unplayableTrackIds,
+                    hiddenHomePlaylistKeys = hiddenHomePlaylistKeys,
+                    userTasteProfile = userTasteProfile,
                     currentTrackId = currentTrackId,
                     isPlaying = isPlaying,
                     hasActiveTrack = hasActiveTrack,
@@ -461,16 +488,17 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
             val bgColor = MaterialTheme.colorScheme.background
 
             Box(modifier = Modifier.fillMaxSize()) {
-                // Underlying stage recorded into dual sharp + 44dp Clamp-Blurred GraphicsLayers
+                // Underlying stage recorded into dual sharp + quarter-res blurred GraphicsLayers (skipped when occluded!)
                 CompositionLocalProvider(
                     LocalInsideBackdropRecording provides true,
-                    LocalGlassBackdrop provides null
+                    LocalGlassBackdrop provides null,
+                    LocalMarqueePaused provides isMainStageOccluded
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .background(bgColor)
-                            .recordGlassBackdrop(mainBackdropRig, bgColor)
+                            .recordGlassBackdrop(mainBackdropRig, bgColor, occluded = isMainStageOccluded)
                     ) {
                         // Static faint dot-matrix architectural depth layer (never moves on scroll or tab swipe)
                         NothingStaticDotMatrixBackdrop()
@@ -489,6 +517,8 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                                 savedIds = savedIds,
                                 downloadedTrackIds = downloadedTrackIds,
                                 downloadProgress = downloadProgress,
+                                unplayableTrackIds = unplayableTrackIds,
+                                hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
                                 onBack = { viewModel.popCollectionPage() },
                                 onPlayTrack = { track, list -> viewModel.playTrackFromContext(track, list) },
                                 onToggleSave = { viewModel.toggleSaveTrack(it) },
@@ -504,6 +534,12 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                                 onDeleteUserPlaylist = { pid -> viewModel.deleteUserPlaylist(pid) },
                                 onMovePlaylistTrack = { pid, from, to -> viewModel.moveTrackInUserPlaylist(pid, from, to) },
                                 onRemovePlaylistTrack = { pid, tid -> viewModel.removeTrackFromUserPlaylist(pid, tid) },
+                                onRemoveCollectionFromHome = { page ->
+                                    viewModel.removeOrDeleteActiveCollectionPage(page, deletePermanently = false)
+                                },
+                                onDeleteCollectionPermanently = { page ->
+                                    viewModel.removeOrDeleteActiveCollectionPage(page, deletePermanently = true)
+                                },
                                 modifier = Modifier.fillMaxSize()
                             )
                         } else {
@@ -513,7 +549,7 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                                 isSpotifyLinked = uiState.spotifyProfile.isConnected,
                                 isYtmEnabled = glyphSettings.ytmEngineEnabled,
                                 audioQualityTier = glyphSettings.audioQualityTier,
-                                spectrum = audioState.glyphSpectrum,
+                                spectrum = bannerAudioState.glyphSpectrum,
                                 glyphReactive = glyphSettings.glyphReactiveLeds,
                                 avatarUrl = uiState.spotifyProfile.avatarUrl,
                                 isScrobblerLinked = scrobblerState.lastFmConnected || scrobblerState.listenBrainzConnected,
@@ -524,6 +560,9 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                                 uiState = uiState,
                                 currentTrackId = currentTrackId,
                                 isPlaying = isPlaying,
+                                unplayableTrackIds = unplayableTrackIds,
+                                hiddenHomePlaylistKeys = hiddenHomePlaylistKeys,
+                                userTasteProfile = userTasteProfile,
                                 recentGridTiles = recentGridTiles,
                                 userPlaylists = userPlaylists,
                                 downloadedTracks = downloadedTracks,
@@ -551,13 +590,13 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                     }
                 }
 
-                // Active 44dp Clamp-Blurred Pure-White Frosted Glass Floating Overlay (Dock + Mini-Player)
+                // Active Pure-White Frosted Glass Floating Overlay (Dock + Mini-Player)
                 CompositionLocalProvider(
                     LocalGlassBackdrop provides mainBackdropRig.toState(
                         extraTick = uiState.activeTab.ordinal * 37 +
-                            uiState.collectionStack.size * 19 +
-                            (if (isPlaying) (audioState.currentPositionMs / 250L).toInt() else 0)
-                    )
+                            uiState.collectionStack.size * 19
+                    ),
+                    LocalMarqueePaused provides isMainStageOccluded
                 ) {
                     Column(
                         modifier = Modifier
@@ -585,12 +624,13 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                         ) {
                             Column {
                                 NothingMiniPlayerPill(
-                                    audioState = audioState,
+                                    audioState = bannerAudioState,
+                                    progressFlow = viewModel.miniProgressFraction,
                                     glyphReactive = glyphSettings.glyphReactiveLeds,
-                                    isSaved = audioState.currentTrack?.id in savedIds,
+                                    isSaved = bannerAudioState.currentTrack?.id in savedIds,
                                     previousTrack = previousQueueTrack,
                                     nextTrack = nextQueueTrack,
-                                    onToggleSave = audioState.currentTrack?.let { tr -> { viewModel.toggleSaveTrack(tr) } },
+                                    onToggleSave = bannerAudioState.currentTrack?.let { tr -> { viewModel.toggleSaveTrack(tr) } },
                                     onExpand = { viewModel.setFullPlayerOpen(true) },
                                     onTogglePlay = { viewModel.togglePlayPause() },
                                     onSkipNext = { viewModel.skipNext() },
@@ -626,7 +666,6 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                 targetOffsetY = { it / 12 }
             )
         ) {
-            val accountBackdropRig = rememberGlassBackdropRig(blurRadius = 44.dp)
             val accountBg = MaterialTheme.colorScheme.background
             Box(
                 modifier = Modifier
@@ -644,9 +683,7 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                     LocalGlassBackdrop provides null
                 ) {
                     Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .recordGlassBackdrop(accountBackdropRig, accountBg)
+                        modifier = Modifier.fillMaxSize()
                     ) {
                         NothingStaticDotMatrixBackdrop()
                         SourcesAndGlyphScreen(
@@ -661,7 +698,7 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                                 viewModel.launchSpotifyOAuth(clientId, safeLaunchExternalUri)
                             },
                             onOpenSpotifyDashboard = {
-                                safeLaunchExternalUri(Uri.parse("https://developer.spotify.com/dashboard"))
+                                safeLaunchExternalUri("https://developer.spotify.com/dashboard".toUri())
                             },
                             onSyncSpotify = { viewModel.syncSpotifyData() },
                             onDisconnectSpotify = { viewModel.disconnectSpotifyAccount() },
@@ -669,7 +706,10 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                             onConnectListenBrainz = { user, token -> viewModel.connectListenBrainz(user, token) },
                             onSyncScrobblerNow = { viewModel.syncScrobblerNow(false) },
                             onDisconnectScrobbler = { viewModel.disconnectScrobbler() },
-                            onOpenPlaylist = { viewModel.openSpotifyPlaylist(it) },
+                            onOpenPlaylist = { sp ->
+                                viewModel.setAccountPageOpen(false)
+                                viewModel.openSpotifyPlaylist(sp)
+                            },
                             onOpenArtist = { artist ->
                                 viewModel.setAccountPageOpen(false)
                                 viewModel.openArtistPage(artist)
@@ -684,6 +724,10 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                             onToggleOled = { viewModel.setOledDarkMode(it) },
                             onToggleGlyphReactive = { viewModel.setGlyphReactive(it) },
                             onToggleAutomix = { viewModel.setAutomixEnabled(it) },
+                            onToggleHideUnplayable = { viewModel.setHideUnplayableSongs(it) },
+                            onSelectDisplayRefreshPolicy = { viewModel.setDisplayRefreshPolicy(it) },
+                            isRealtimeFftActive = bannerAudioState.isRealtimeFftActive,
+                            onVisualizerPermissionResult = { viewModel.onVisualizerPermissionResult(it) },
                             onToggleHaptics = { viewModel.setTactileHaptics(it) },
                             onReopenOnboarding = { viewModel.reopenOnboardingGuide() },
                             onBack = { viewModel.setAccountPageOpen(false) },
@@ -696,7 +740,7 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
             }
         }
 
-        // Full-Screen Immersive Nchord Deck
+        // Full-Screen Immersive Nchord Deck (collects 12Hz audioState strictly inside this scope!)
         AnimatedVisibility(
             visible = uiState.isFullPlayerOpen && hasActiveTrack,
             enter = fadeIn(tween(200)) + slideInVertically(
@@ -706,21 +750,36 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                 ),
                 initialOffsetY = { it }
             ),
-            exit = fadeOut(tween(160)) + slideOutVertically(
-                animationSpec = tween(220),
-                targetOffsetY = { it }
-            )
+            exit = if (playerDismissedBySwipe) {
+                // Sheet already slid completely off-screen during swipe release — avoid duplicate slide-out bounce
+                fadeOut(tween(40))
+            } else {
+                fadeOut(tween(160)) + slideOutVertically(
+                    animationSpec = tween(220),
+                    targetOffsetY = { it }
+                )
+            }
         ) {
-            val activeTrack = audioState.currentTrack
+            val activeTrack = bannerAudioState.currentTrack
             FullScreenNothingPlayer(
                 uiState = uiState,
-                audioState = audioState,
+                audioState = bannerAudioState,
+                liveAudioStateFlow = viewModel.audioState,
                 isSaved = activeTrack != null && activeTrack.id in savedIds,
                 savedIds = savedIds,
                 downloadedTrackIds = downloadedTrackIds,
                 downloadProgress = downloadProgress,
+                unplayableTrackIds = unplayableTrackIds,
+                hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
                 glyphReactive = glyphSettings.glyphReactiveLeds,
-                onCollapse = { viewModel.setFullPlayerOpen(false) },
+                onCollapse = {
+                    playerDismissedBySwipe = false
+                    viewModel.setFullPlayerOpen(false)
+                },
+                onSwipeDismiss = {
+                    playerDismissedBySwipe = true
+                    viewModel.setFullPlayerOpen(false)
+                },
                 onTogglePlay = { viewModel.togglePlayPause() },
                 onSkipPrev = { viewModel.skipPrevious() },
                 onSkipNext = { viewModel.skipNext() },
@@ -767,7 +826,11 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
 private fun ExpandedMainStage(
     headerTitle: String,
     uiState: NothingUiState,
-    audioState: AudioEngineState,
+    bannerAudioState: AudioEngineState,
+    isMainStageOccluded: Boolean,
+    unplayableTrackIds: Set<String>,
+    hiddenHomePlaylistKeys: Set<String>,
+    userTasteProfile: com.example.domain.UserTasteProfile,
     currentTrackId: String?,
     isPlaying: Boolean,
     hasActiveTrack: Boolean,
@@ -797,13 +860,14 @@ private fun ExpandedMainStage(
     Box(modifier = modifier) {
         CompositionLocalProvider(
             LocalInsideBackdropRecording provides true,
-            LocalGlassBackdrop provides null
+            LocalGlassBackdrop provides null,
+            LocalMarqueePaused provides isMainStageOccluded
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(bgColor)
-                    .recordGlassBackdrop(expandedBackdropRig, bgColor)
+                    .recordGlassBackdrop(expandedBackdropRig, bgColor, occluded = isMainStageOccluded)
             ) {
                 NothingStaticDotMatrixBackdrop()
 
@@ -821,6 +885,8 @@ private fun ExpandedMainStage(
                         savedIds = savedIds,
                         downloadedTrackIds = downloadedTrackIds,
                         downloadProgress = downloadProgress,
+                        unplayableTrackIds = unplayableTrackIds,
+                        hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
                         onBack = { viewModel.popCollectionPage() },
                         onPlayTrack = { track, list -> viewModel.playTrackFromContext(track, list) },
                         onToggleSave = { viewModel.toggleSaveTrack(it) },
@@ -836,6 +902,12 @@ private fun ExpandedMainStage(
                         onDeleteUserPlaylist = { pid -> viewModel.deleteUserPlaylist(pid) },
                         onMovePlaylistTrack = { pid, from, to -> viewModel.moveTrackInUserPlaylist(pid, from, to) },
                         onRemovePlaylistTrack = { pid, tid -> viewModel.removeTrackFromUserPlaylist(pid, tid) },
+                        onRemoveCollectionFromHome = { page ->
+                            viewModel.removeOrDeleteActiveCollectionPage(page, deletePermanently = false)
+                        },
+                        onDeleteCollectionPermanently = { page ->
+                            viewModel.removeOrDeleteActiveCollectionPage(page, deletePermanently = true)
+                        },
                         modifier = Modifier
                             .widthIn(max = 860.dp)
                             .align(Alignment.CenterHorizontally)
@@ -848,7 +920,7 @@ private fun ExpandedMainStage(
                         isSpotifyLinked = uiState.spotifyProfile.isConnected,
                         isYtmEnabled = glyphSettings.ytmEngineEnabled,
                         audioQualityTier = glyphSettings.audioQualityTier,
-                        spectrum = audioState.glyphSpectrum,
+                        spectrum = bannerAudioState.glyphSpectrum,
                         glyphReactive = glyphSettings.glyphReactiveLeds,
                         avatarUrl = uiState.spotifyProfile.avatarUrl,
                         isScrobblerLinked = scrobblerState.lastFmConnected || scrobblerState.listenBrainzConnected,
@@ -859,6 +931,9 @@ private fun ExpandedMainStage(
                         uiState = uiState,
                         currentTrackId = currentTrackId,
                         isPlaying = isPlaying,
+                        unplayableTrackIds = unplayableTrackIds,
+                        hiddenHomePlaylistKeys = hiddenHomePlaylistKeys,
+                        userTasteProfile = userTasteProfile,
                         recentGridTiles = recentGridTiles,
                         userPlaylists = userPlaylists,
                         downloadedTracks = downloadedTracks,
@@ -889,9 +964,9 @@ private fun ExpandedMainStage(
         CompositionLocalProvider(
             LocalGlassBackdrop provides expandedBackdropRig.toState(
                 extraTick = uiState.activeTab.ordinal * 37 +
-                    uiState.collectionStack.size * 19 +
-                    (if (isPlaying) (audioState.currentPositionMs / 250L).toInt() else 0)
-            )
+                    uiState.collectionStack.size * 19
+            ),
+            LocalMarqueePaused provides isMainStageOccluded
         ) {
             Column(
                 modifier = Modifier
@@ -924,12 +999,13 @@ private fun ExpandedMainStage(
                         uiState.queue.getOrNull(uiState.currentQueueIndex + 1)
                     } else null
                     NothingMiniPlayerPill(
-                        audioState = audioState,
+                        audioState = bannerAudioState,
+                        progressFlow = viewModel.miniProgressFraction,
                         glyphReactive = glyphSettings.glyphReactiveLeds,
-                        isSaved = audioState.currentTrack?.id in savedIds,
+                        isSaved = bannerAudioState.currentTrack?.id in savedIds,
                         previousTrack = expPrevTrack,
                         nextTrack = expNextTrack,
-                        onToggleSave = audioState.currentTrack?.let { tr -> { viewModel.toggleSaveTrack(tr) } },
+                        onToggleSave = bannerAudioState.currentTrack?.let { tr -> { viewModel.toggleSaveTrack(tr) } },
                         onExpand = { viewModel.setFullPlayerOpen(true) },
                         onTogglePlay = { viewModel.togglePlayPause() },
                         onSkipNext = { viewModel.skipNext() },
@@ -975,7 +1051,9 @@ private fun FrostedGlassDock(
         Box(modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp)) {
             Box(
                 modifier = Modifier
-                    .offset(x = pillOffsetX)
+                    .graphicsLayer {
+                        translationX = pillOffsetX.toPx()
+                    }
                     .size(itemSize)
                     .clip(CircleShape)
                     .background(activePillColor)
@@ -1028,6 +1106,9 @@ private fun AnimatedTabContent(
     uiState: NothingUiState,
     currentTrackId: String?,
     isPlaying: Boolean,
+    unplayableTrackIds: Set<String>,
+    hiddenHomePlaylistKeys: Set<String>,
+    userTasteProfile: com.example.domain.UserTasteProfile,
     recentGridTiles: List<RecentGridTile>,
     userPlaylists: List<UserPlaylist>,
     downloadedTracks: List<TrackItem>,
@@ -1067,6 +1148,10 @@ private fun AnimatedTabContent(
                 currentTrackId = currentTrackId,
                 isPlaying = isPlaying,
                 savedIds = savedIds,
+                unplayableTrackIds = unplayableTrackIds,
+                hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
+                hiddenPlaylistKeys = hiddenHomePlaylistKeys,
+                tasteProfile = userTasteProfile,
                 onSelectHomeFilter = { viewModel.setHomeFeedFilter(it) },
                 onSelectMood = { viewModel.selectMoodChannel(it) },
                 onOpenRecentTile = { viewModel.openRecentGridTile(it) },
@@ -1074,6 +1159,10 @@ private fun AnimatedTabContent(
                 onPlayCarouselPlaylist = { pl, shuffle ->
                     viewModel.playCarouselPlaylistImmediately(pl, shuffle)
                 },
+                onRemoveRecentTileFromHome = { viewModel.removeRecentTileFromHome(it) },
+                onDeleteRecentTilePlaylist = { viewModel.deleteRecentTilePlaylist(it) },
+                onRemoveCarouselPlaylistFromHome = { viewModel.removeCarouselPlaylistFromHome(it) },
+                onDeleteCarouselPlaylist = { viewModel.deleteCarouselPlaylistCompletely(it) },
                 onOpenAlbumForTrack = { viewModel.openAlbumForTrack(it) },
                 onPlayTrack = { track, list -> viewModel.playTrackFromContext(track, list) },
                 onToggleSave = { viewModel.toggleSaveTrack(it) },
@@ -1090,6 +1179,9 @@ private fun AnimatedTabContent(
                 savedIds = savedIds,
                 downloadedTrackIds = downloadedTrackIds,
                 downloadProgress = downloadProgress,
+                unplayableTrackIds = unplayableTrackIds,
+                hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
+                tasteProfile = userTasteProfile,
                 onQueryChange = { viewModel.onSearchQueryChanged(it) },
                 onToggleSource = { viewModel.toggleSearchSource(it) },
                 onSelectFilter = { viewModel.setSearchFilter(it) },
@@ -1115,6 +1207,8 @@ private fun AnimatedTabContent(
                 currentTrackId = currentTrackId,
                 isPlaying = isPlaying,
                 savedIds = savedIds,
+                unplayableTrackIds = unplayableTrackIds,
+                hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
                 onTogglePinItem = { key, label -> viewModel.togglePinLibraryItem(key, label) },
                 onDeleteUserPlaylist = { viewModel.deleteUserPlaylist(it.id) },
                 onOpenUserPlaylist = { viewModel.openUserPlaylist(it) },
@@ -1129,12 +1223,16 @@ private fun AnimatedTabContent(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Studio Tab: Pure Stats, Data & Taste Profiling (Nothing OS Weather bento style)
+            // Studio Tab: Minimal Nothing OS Acoustic Atelier & Telemetry (No Playback Speed Controls)
             NothingTab.SOURCES -> InsightsScreen(
                 snapshot = insightsSnapshot,
                 scrobblerState = scrobblerState,
                 spotifyProfile = uiState.spotifyProfile,
                 isPlaying = isPlaying,
+                onOpenEqualizer = onOpenSystemEqualizer,
+                onPlayTopTrack = { crown ->
+                    viewModel.playTrackFromContext(crown, listOf(crown))
+                },
                 onOpenArtist = { viewModel.openArtistPage(it) },
                 onConnectLastFm = { user, pass -> viewModel.connectLastFm(user, pass) },
                 onConnectListenBrainz = { user, token -> viewModel.connectListenBrainz(user, token) },
@@ -1148,31 +1246,37 @@ private fun AnimatedTabContent(
 
 /**
  * Static faint dot-matrix architectural backdrop sitting directly above the theme surface.
- * Fixed in screen space — never scrolls or shifts during list scrolling or tab transitions.
+ * Rendered via a cached tiled GPU [ShaderBrush] (single GPU quad draw call instead of ~1,000 circles).
  */
 @Composable
 fun NothingStaticDotMatrixBackdrop(modifier: Modifier = Modifier) {
     val onBg = MaterialTheme.colorScheme.onBackground
     val isDark = MaterialTheme.colorScheme.background.red < 0.2f
     val dotColor = onBg.copy(alpha = if (isDark) 0.088f else 0.072f)
-    androidx.compose.foundation.Canvas(modifier = modifier.fillMaxSize()) {
-        val spacingPx = 18.dp.toPx().coerceAtLeast(8f)
-        val radiusPx = 1.05.dp.toPx()
-        val cols = (size.width / spacingPx).toInt() + 1
-        val rows = (size.height / spacingPx).toInt() + 1
-        val offsetX = (size.width - (cols - 1) * spacingPx) * 0.5f
-        val offsetY = (size.height - (rows - 1) * spacingPx) * 0.5f
-
-        for (r in 0 until rows) {
-            val y = offsetY + r * spacingPx
-            for (c in 0 until cols) {
-                val x = offsetX + c * spacingPx
-                drawCircle(
-                    color = dotColor,
-                    radius = radiusPx,
-                    center = androidx.compose.ui.geometry.Offset(x, y)
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .drawWithCache {
+                val tileSizePx = 18.dp.toPx().roundToInt().coerceAtLeast(10)
+                val radiusPx = 1.05.dp.toPx()
+                val bitmap = ImageBitmap(tileSizePx, tileSizePx)
+                val tileCanvas = ComposeCanvas(bitmap)
+                val paint = Paint().apply {
+                    isAntiAlias = true
+                    color = dotColor
+                }
+                val center = Offset(tileSizePx * 0.5f, tileSizePx * 0.5f)
+                tileCanvas.drawCircle(center, radiusPx, paint)
+                val tiledBrush = ShaderBrush(
+                    ImageShader(
+                        image = bitmap,
+                        tileModeX = TileMode.Repeated,
+                        tileModeY = TileMode.Repeated
+                    )
                 )
+                onDrawBehind {
+                    drawRect(brush = tiledBrush)
+                }
             }
-        }
-    }
+    )
 }

@@ -42,7 +42,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -210,6 +212,7 @@ data class NothingUiState(
     val isSearching: Boolean = false,
     val searchError: String? = null,
     val searchNotice: String? = null,
+    val searchKeyboardRequestNonce: Int = 0,
 
     // Spotify & External Sync
     val spotifyProfile: SpotifyProfileState = SpotifyProfileState(),
@@ -251,6 +254,57 @@ class NothingChordViewModel(
     val uiState: StateFlow<NothingUiState> = _uiState.asStateFlow()
 
     val audioState: StateFlow<AudioEngineState> = audioEngine.state
+
+    /**
+     * Low-frequency playback banner state that ignores 12Hz `currentPositionMs` and `glyphSpectrum`
+     * ticks so root screens, headers, lists, and frosted glass layers never recompose during playback.
+     */
+    val playbackBannerState: StateFlow<AudioEngineState> = audioEngine.state
+        .map { s ->
+            s.copy(
+                currentPositionMs = 0L,
+                glyphSpectrum = emptyList(),
+                sixBandSpectrum = emptyList()
+            )
+        }
+        .distinctUntilChanged()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = AudioEngineState()
+        )
+
+    /**
+     * Quantized progress fraction (`0.004f` steps) dedicated exclusively to the `1.5.dp` mini-player
+     * progress bar so it updates ~2–3x/sec instead of invalidating the entire screen tree.
+     */
+    val miniProgressFraction: StateFlow<Float> = audioEngine.state
+        .map { s ->
+            val dur = s.durationMs.takeIf { it > 0L } ?: s.currentTrack?.durationMs ?: 0L
+            if (dur <= 0L) 0f
+            else {
+                val raw = (s.currentPositionMs.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+                ((raw * 250f).toInt() / 250f).coerceIn(0f, 1f)
+            }
+        }
+        .distinctUntilChanged()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = 0f
+        )
+
+    val unplayableTrackIds: StateFlow<Set<String>> = repository.unplayableTrackIdsFlow.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000L),
+        initialValue = emptySet()
+    )
+
+    val hiddenHomePlaylistKeys: StateFlow<Set<String>> = repository.hiddenHomePlaylistKeysFlow.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000L),
+        initialValue = emptySet()
+    )
 
     val savedTracks: StateFlow<List<TrackItem>> = repository.savedTracksFlow.stateIn(
         scope = viewModelScope,
@@ -308,6 +362,31 @@ class NothingChordViewModel(
         initialValue = emptyList()
     )
 
+    private val spotifyTasteSliceFlow = _uiState
+        .map { it.spotifyProfile.topArtists to it.spotifyTopTracks }
+        .distinctUntilChanged()
+
+    val userTasteProfile: StateFlow<com.example.domain.UserTasteProfile> = combine(
+        savedTracks,
+        repository.allScrobblesFlow,
+        downloadedTracks,
+        userPlaylists,
+        spotifyTasteSliceFlow
+    ) { saved, scrobbles, downloads, playlists, (spArtists, spTopTracks) ->
+        com.example.domain.TasteAndSearchRankingEngine.buildTasteProfile(
+            savedTracks = saved,
+            scrobbles = scrobbles,
+            downloadedTracks = downloads,
+            userPlaylists = playlists,
+            spotifyTopArtists = spArtists,
+            spotifyTopTracks = spTopTracks
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000L),
+        initialValue = com.example.domain.UserTasteProfile()
+    )
+
     private val _remoteScrobblerMeta = MutableStateFlow(ScrobblerConfigAndState())
 
     val scrobblerState: StateFlow<ScrobblerConfigAndState> = combine(
@@ -335,18 +414,61 @@ class NothingChordViewModel(
         initialValue = ScrobblerConfigAndState()
     )
 
+    private data class HomeUiSlice(
+        val firstMoodArtwork: String,
+        val spotifyPlaylists: List<SpotifyPlaylistSummary>,
+        val curatedPlaylists: List<SuggestedPlaylist>,
+        val hiddenKeys: Set<String>
+    )
+
+    private data class InsightsUiSlice(
+        val spotifyTopArtistNames: List<String>,
+        val artworkTracks: List<TrackItem>,
+        val fallbackTopTrack: TrackItem?
+    )
+
+    private val homeUiSliceFlow = combine(
+        _uiState,
+        repository.hiddenHomePlaylistKeysFlow
+    ) { s, hidden ->
+        HomeUiSlice(
+            firstMoodArtwork = s.moodTracks.firstOrNull()?.artworkUrl
+                ?: s.featuredTracks.firstOrNull()?.artworkUrl.orEmpty(),
+            spotifyPlaylists = s.spotifyPlaylists,
+            curatedPlaylists = s.suggestedPlaylists + s.ytmSessionPlaylists + s.spotifyCratePlaylists,
+            hiddenKeys = hidden
+        )
+    }.distinctUntilChanged()
+
+    private val insightsUiSliceFlow = _uiState
+        .map { s ->
+            InsightsUiSlice(
+                spotifyTopArtistNames = s.spotifyProfile.topArtists,
+                artworkTracks = s.moodTracks + s.featuredTracks,
+                fallbackTopTrack = s.spotifyTopTracks.firstOrNull() ?: s.featuredTracks.firstOrNull()
+            )
+        }
+        .distinctUntilChanged()
+
     val homeRecentGridTiles: StateFlow<List<RecentGridTile>> = combine(
         repository.recentCollectionsFlow,
         savedTracks,
         downloadedTracks,
         userPlaylists,
-        _uiState
-    ) { recentCols, saved, downloaded, userPls, state ->
+        homeUiSliceFlow
+    ) { recentCols, saved, downloaded, userPls, slice ->
         val tiles = ArrayList<RecentGridTile>(8)
         val seenIds = HashSet<String>()
+        val hidden = slice.hiddenKeys
+
+        fun isHiddenTile(tile: RecentGridTile): Boolean {
+            if (tile.id in hidden) return true
+            if (tile.referenceId.isNotBlank() && tile.referenceId in hidden) return true
+            return false
+        }
 
         fun addUnique(tile: RecentGridTile) {
-            if (tiles.size < 8 && seenIds.add(tile.id)) {
+            if (!isHiddenTile(tile) && tiles.size < 8 && seenIds.add(tile.id)) {
                 tiles.add(tile)
             }
         }
@@ -370,8 +492,7 @@ class NothingChordViewModel(
                 id = "smart_on_repeat",
                 title = "On Repeat",
                 subtitle = "Heavy rotation",
-                artworkUrl = state.moodTracks.firstOrNull()?.artworkUrl
-                    ?: state.featuredTracks.firstOrNull()?.artworkUrl.orEmpty(),
+                artworkUrl = slice.firstMoodArtwork,
                 kind = RecentTileKind.ON_REPEAT
             )
         )
@@ -404,7 +525,7 @@ class NothingChordViewModel(
             )
         }
 
-        state.spotifyPlaylists.take(4).forEach { sp ->
+        slice.spotifyPlaylists.take(4).forEach { sp ->
             addUnique(
                 RecentGridTile(
                     id = "sp_${sp.id}",
@@ -417,8 +538,7 @@ class NothingChordViewModel(
             )
         }
 
-        val allCurated = state.suggestedPlaylists + state.ytmSessionPlaylists + state.spotifyCratePlaylists
-        allCurated.forEach { cur ->
+        slice.curatedPlaylists.forEach { cur ->
             addUnique(
                 RecentGridTile(
                     id = "cur_${cur.id}",
@@ -448,9 +568,10 @@ class NothingChordViewModel(
     val insightsSnapshot: StateFlow<InsightsSnapshot> = combine(
         repository.allScrobblesFlow,
         downloadedTracks,
+        savedTracks,
         scrobblerState,
-        _uiState
-    ) { scrobbles, downloads, scrobbler, state ->
+        insightsUiSliceFlow
+    ) { scrobbles, downloads, saved, scrobbler, slice ->
         val localPlays = scrobbles.size
         val totalPlays = maxOf(localPlays, scrobbler.remotePlayCount)
         val localMinutes = scrobbles.sumOf { it.durationMs.coerceAtLeast(60_000L) } / 60_000L
@@ -495,7 +616,7 @@ class NothingChordViewModel(
                 artistArtworkMap[primary] = s.artworkUrl
             }
         }
-        (state.moodTracks + state.featuredTracks + downloads).forEach { t ->
+        (slice.artworkTracks + downloads + saved).forEach { t ->
             val primary = t.artist.substringBefore(",").trim()
             if (primary.isNotBlank() && t.artworkUrl.isNotBlank() && !artistArtworkMap.containsKey(primary)) {
                 artistArtworkMap[primary] = t.artworkUrl
@@ -516,7 +637,7 @@ class NothingChordViewModel(
             }
         }
         if (artistPlayCounts.isEmpty()) {
-            state.spotifyProfile.topArtists.forEachIndexed { idx, name ->
+            slice.spotifyTopArtistNames.forEachIndexed { idx, name ->
                 artistPlayCounts[name] = (12 - idx * 2).coerceAtLeast(2)
             }
         }
@@ -547,21 +668,73 @@ class NothingChordViewModel(
                 sourceType = runCatching { AudioSourceType.valueOf(s.sourceTypeName) }
                     .getOrDefault(AudioSourceType.YTM_ADFREE)
             )
-        } ?: state.spotifyTopTracks.firstOrNull() ?: state.featuredTracks.firstOrNull()
+        } ?: slice.fallbackTopTrack
+
+        val streakDays = dayKeys.size.coerceAtLeast(if (totalPlays > 0) 1 else 0)
+        val nightPlays = (20..23).sumOf { hourCounts[it] } + (0..4).sumOf { hourCounts[it] }
+        val nightSharePercent = if (localPlays > 0) {
+            ((nightPlays.toFloat() / localPlays.toFloat()) * 100f).toInt().coerceIn(0, 100)
+        } else {
+            58
+        }
+
+        val durationPool = if (scrobbles.isNotEmpty()) {
+            scrobbles.map { it.durationMs.coerceIn(60_000L, 900_000L) }
+        } else {
+            (saved + downloads + slice.artworkTracks).map { it.durationMs.coerceIn(90_000L, 900_000L) }
+        }
+        val avgTrackDurationSec = if (durationPool.isNotEmpty()) {
+            ((durationPool.sum() / durationPool.size) / 1000L).toInt().coerceIn(90, 900)
+        } else {
+            214
+        }
+
+        val uniqueCount = artistPlayCounts.size
+        val spinsPerArtist = if (uniqueCount > 0) {
+            totalPlays.toFloat() / uniqueCount.toFloat()
+        } else 1.4f
+        val replayLoyaltyPercent = if (totalPlays > 0) {
+            (((spinsPerArtist - 1f) / 4.2f) * 82f + 18f).toInt().coerceIn(14, 98)
+        } else {
+            42
+        }
+        val immersionScorePercent = (((avgTrackDurationSec - 130f) / 150f) * 78f + 20f)
+            .toInt()
+            .coerceIn(18, 97)
+        val vaultAutonomyPercent = if (totalPlays > 0 || saved.isNotEmpty() || downloads.isNotEmpty()) {
+            val offlineRatioBoost = if (totalPlays > 0) ((offlinePlays.toFloat() / totalPlays.toFloat()) * 48f).toInt() else 0
+            (16 + saved.size * 3 + downloads.size * 8 + offlineRatioBoost).coerceIn(16, 98)
+        } else {
+            24
+        }
+        val activeHourSlots = hourCounts.count { it > 0 }
+        val cadenceConsistencyPercent = if (totalPlays > 0) {
+            (22 + streakDays * 14 + activeHourSlots * 4).coerceIn(24, 98)
+        } else {
+            36
+        }
 
         InsightsSnapshot(
             totalMinutes = effectiveMinutes,
             totalPlays = totalPlays,
             offlinePlays = offlinePlays,
             downloadedTracksCount = downloads.size,
-            uniqueArtistsCount = artistPlayCounts.size,
-            streakDays = dayKeys.size.coerceAtLeast(if (totalPlays > 0) 1 else 0),
+            savedTracksCount = saved.size,
+            uniqueArtistsCount = uniqueCount,
+            streakDays = streakDays,
             peakHour = peakHour,
             collectorArchetype = archetype,
             hourlyMatrix = hourlyNormalized,
+            hourlyPlayCounts = hourCounts.toList(),
             topArtists = topArtists,
             topTrack = topTrack,
-            topTrackPlays = topTrackGroup?.value?.size ?: if (topTrack != null) 1 else 0
+            topTrackPlays = topTrackGroup?.value?.size ?: if (topTrack != null) 1 else 0,
+            avgTrackDurationSec = avgTrackDurationSec,
+            nightSharePercent = nightSharePercent,
+            replayLoyaltyPercent = replayLoyaltyPercent,
+            immersionScorePercent = immersionScorePercent,
+            vaultAutonomyPercent = vaultAutonomyPercent,
+            cadenceConsistencyPercent = cadenceConsistencyPercent
         )
     }.stateIn(
         scope = viewModelScope,
@@ -601,35 +774,83 @@ class NothingChordViewModel(
             _isInitialPrefsLoaded.value = true
         }
         observePreparedDurationForLyricsSync()
+        observeTasteProfileEvolution()
         loadInitialDiscoverFeeds()
         observeSpotifyTokenStartup()
         observeScrobblerStartup()
     }
 
+    private fun observeTasteProfileEvolution() {
+        viewModelScope.launch {
+            var previousLeadSeeds: List<String> = emptyList()
+            userTasteProfile.collect { profile ->
+                val state = _uiState.value
+                if (state.selectedMoodId == "foryou" &&
+                    (state.moodTracks.isNotEmpty() || state.featuredTracks.isNotEmpty())
+                ) {
+                    val unplayable = unplayableTrackIds.value
+                    _uiState.update { cur ->
+                        cur.copy(
+                            moodTracks = com.example.domain.TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                                tracks = cur.moodTracks,
+                                profile = profile,
+                                unplayableIds = unplayable
+                            ),
+                            featuredTracks = com.example.domain.TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                                tracks = cur.featuredTracks,
+                                profile = profile,
+                                unplayableIds = unplayable
+                            )
+                        )
+                    }
+                }
+                val leadSeeds = profile.topAffinityArtists.take(3)
+                if (previousLeadSeeds.isEmpty() && leadSeeds.isNotEmpty() && state.selectedMoodId == "foryou") {
+                    previousLeadSeeds = leadSeeds
+                    val forYouChannel = DEFAULT_MOOD_CHANNELS.first()
+                    fetchDiscoverForChannel(forYouChannel, isInitialLoad = false)
+                } else if (leadSeeds.isNotEmpty()) {
+                    previousLeadSeeds = leadSeeds
+                }
+            }
+        }
+    }
+
     private fun observePreparedDurationForLyricsSync() {
         viewModelScope.launch {
-            audioState.collect { engine ->
-                val tr = engine.currentTrack ?: return@collect
-                val preparedDur = engine.durationMs
-                if (!engine.isBuffering &&
-                    preparedDur > 35_000L &&
-                    tr.id == lastLyricsTrackId &&
-                    kotlin.math.abs(preparedDur - lastLyricsDurationMs) > 4_000L
-                ) {
-                    lastLyricsDurationMs = preparedDur
-                    lyricsResyncJob?.cancel()
-                    lyricsResyncJob = viewModelScope.launch {
-                        val refined = repository.fetchSyncedLyrics(
-                            trackTitle = tr.title,
-                            artistName = tr.artist,
-                            durationMs = preparedDur
-                        )
-                        if (refined.isNotEmpty() && audioState.value.currentTrack?.id == tr.id) {
-                            _uiState.update { it.copy(lyrics = refined, isLyricsLoading = false) }
+            audioState
+                .map { Triple(it.currentTrack, it.durationMs, it.isBuffering) }
+                .distinctUntilChanged { a, b ->
+                    a.first?.id == b.first?.id && a.second == b.second && a.third == b.third
+                }
+                .collect { (tr, preparedDur, isBuffering) ->
+                    if (tr == null) return@collect
+                    if (!isBuffering &&
+                        preparedDur > 35_000L &&
+                        tr.id == lastLyricsTrackId &&
+                        kotlin.math.abs(preparedDur - lastLyricsDurationMs) > 4_000L
+                    ) {
+                        lastLyricsDurationMs = preparedDur
+                        lyricsResyncJob?.cancel()
+                        lyricsResyncJob = viewModelScope.launch {
+                            val refined = repository.fetchSyncedLyrics(
+                                trackTitle = tr.title,
+                                artistName = tr.artist,
+                                durationMs = preparedDur
+                            )
+                            if (refined.isNotEmpty() && audioState.value.currentTrack?.id == tr.id) {
+                                _uiState.update { it.copy(lyrics = refined, isLyricsLoading = false) }
+                            }
                         }
                     }
                 }
-            }
+        }
+    }
+
+    private fun schedulePlayabilityProbe(tracks: List<TrackItem>) {
+        if (tracks.isEmpty()) return
+        viewModelScope.launch {
+            repository.probeTracksPlayability(tracks)
         }
     }
 
@@ -704,23 +925,15 @@ class NothingChordViewModel(
     // PERSONALIZED HOME DISCOVERY & GENRE / STYLE CHIPS
     // =========================================================================
 
-    private fun computePersonalizedArtistSeeds(fallbackSeeds: List<String>): List<String> {
-        val spArtists = _uiState.value.spotifyProfile.topArtists.take(3)
-        val savedArtists = savedTracks.value
-            .map { it.artist.substringBefore(",").trim() }
-            .filter { it.isNotBlank() && !it.equals("Device Storage", true) }
-            .distinct()
-            .take(3)
-        val recentArtists = recentScrobbles.value
-            .map { it.artist.substringBefore(",").trim() }
-            .filter { it.isNotBlank() && !it.equals("Device Storage", true) }
-            .distinct()
-            .take(2)
-        val personal = (spArtists + savedArtists + recentArtists).distinct()
-        return (personal + fallbackSeeds.map { it.trim() })
-            .filter { it.isNotBlank() }
-            .distinct()
-            .take(6)
+    private fun computePersonalizedArtistSeeds(
+        channelId: String,
+        fallbackSeeds: List<String>
+    ): List<String> {
+        return com.example.domain.TasteAndSearchRankingEngine.buildPersonalizedArtistSeeds(
+            profile = userTasteProfile.value,
+            channelId = channelId,
+            fallbackSeeds = fallbackSeeds
+        )
     }
 
     private fun interleaveTrackLists(buckets: List<List<TrackItem>>, maxTotal: Int): List<TrackItem> {
@@ -783,11 +996,10 @@ class NothingChordViewModel(
         }
 
         moodFetchJob = viewModelScope.launch {
-            val baseSeeds = if (channel.id == "foryou") {
-                computePersonalizedArtistSeeds(channel.artistSeeds)
-            } else {
-                channel.artistSeeds.map { it.trim() }
-            }
+            val baseSeeds = computePersonalizedArtistSeeds(
+                channelId = channel.id,
+                fallbackSeeds = channel.artistSeeds
+            )
             val orderedArtistSeeds = if (shuffleOrder) baseSeeds.shuffled() else baseSeeds
             val orderedReleaseSeeds = if (shuffleOrder) channel.releaseSeeds.shuffled() else channel.releaseSeeds
 
@@ -842,11 +1054,31 @@ class NothingChordViewModel(
                     _uiState.value.spotifyTopTracks.take(6)
                 } else emptyList()
 
-                val moodList = interleaveTrackLists(
+                val rawMoodList = interleaveTrackLists(
                     buckets = if (spTopForYou.isNotEmpty()) listOf(spTopForYou) + moodBuckets else moodBuckets,
-                    maxTotal = 18
+                    maxTotal = 20
                 )
-                val featured = interleaveTrackLists(releaseBuckets, maxTotal = 12)
+                val rawFeatured = interleaveTrackLists(releaseBuckets, maxTotal = 14)
+                val currentTaste = userTasteProfile.value
+                val unplayableNow = unplayableTrackIds.value
+                val moodList = if (shuffleOrder) {
+                    rawMoodList.take(18)
+                } else {
+                    com.example.domain.TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                        tracks = rawMoodList,
+                        profile = currentTaste,
+                        unplayableIds = unplayableNow
+                    ).take(18)
+                }
+                val featured = if (shuffleOrder) {
+                    rawFeatured.take(12)
+                } else {
+                    com.example.domain.TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                        tracks = rawFeatured,
+                        profile = currentTaste,
+                        unplayableIds = unplayableNow
+                    ).take(12)
+                }
 
                 val paletteAccents = listOf(0xFF1ED760, 0xFFD71921, 0xFFA855F7, 0xFF38BDF8, 0xFFF59E0B)
                 val nchordMixes = playlists.mapIndexed { idx, pl ->
@@ -893,6 +1125,7 @@ class NothingChordViewModel(
                         } else null
                     )
                 }
+                schedulePlayabilityProbe(moodList.take(10))
             }
         }
     }
@@ -980,7 +1213,10 @@ class NothingChordViewModel(
                         isLoading = false
                     )
                 }
+                schedulePlayabilityProbe(tracks)
             }
+        } else {
+            schedulePlayabilityProbe(playlist.preloadedTracks)
         }
     }
 
@@ -1041,7 +1277,10 @@ class NothingChordViewModel(
             )
         )
         viewModelScope.launch {
-            val tracks = repository.fetchSpotifyPlaylistTracks(playlist.id).getOrDefault(emptyList())
+            val tracks = repository.fetchSpotifyPlaylistTracks(
+                playlistId = playlist.id,
+                fallbackTitleHint = playlist.name
+            ).getOrDefault(emptyList())
             updateCollectionPageById(pageId) {
                 it.copy(
                     tracks = tracks,
@@ -1049,6 +1288,7 @@ class NothingChordViewModel(
                     isLoading = false
                 )
             }
+            schedulePlayabilityProbe(tracks)
         }
     }
 
@@ -1072,6 +1312,7 @@ class NothingChordViewModel(
             updateCollectionPageById(pageId) {
                 resolvedPage.copy(id = pageId)
             }
+            schedulePlayabilityProbe(resolvedPage.tracks)
         }
     }
 
@@ -1100,6 +1341,7 @@ class NothingChordViewModel(
             updateCollectionPageById(pageId) {
                 resolved.copy(id = pageId)
             }
+            schedulePlayabilityProbe(resolved.tracks)
         }
     }
 
@@ -1139,7 +1381,9 @@ class NothingChordViewModel(
                 )
             }
             RecentTileKind.ON_REPEAT -> {
-                val list = (recentScrobbles.value + _uiState.value.moodTracks).distinctBy { it.id }.take(25)
+                val list = (recentScrobbles.value + _uiState.value.moodTracks + _uiState.value.featuredTracks)
+                    .distinctBy { it.id }
+                    .take(25)
                 pushCollectionPage(
                     CollectionPageState(
                         id = "col_on_repeat",
@@ -1154,27 +1398,106 @@ class NothingChordViewModel(
                     )
                 )
             }
+            RecentTileKind.ALBUM -> {
+                val seedTrack = TrackItem(
+                    id = tile.referenceId.ifBlank { tile.id },
+                    title = tile.title,
+                    artist = tile.subtitle.takeIf { it.isNotBlank() && !it.equals("ALBUM", true) }.orEmpty(),
+                    album = tile.title,
+                    artworkUrl = tile.artworkUrl,
+                    audioStreamUrl = null,
+                    durationMs = 210_000L,
+                    sourceType = AudioSourceType.YTM_ADFREE
+                )
+                openAlbumForTrack(seedTrack)
+            }
+            RecentTileKind.ARTIST -> {
+                openArtistPage(
+                    artistName = tile.title,
+                    fallbackArtwork = tile.artworkUrl
+                )
+            }
             RecentTileKind.USER_PLAYLIST -> {
-                val found = userPlaylists.value.firstOrNull { it.id == tile.referenceId }
+                val cleanRef = tile.referenceId.removePrefix("upl_")
+                val found = userPlaylists.value.firstOrNull {
+                    it.id == tile.referenceId || it.id == cleanRef
+                }
                 if (found != null) {
                     openUserPlaylist(found)
+                } else {
+                    openCarouselPlaylist(
+                        SuggestedPlaylist(
+                            id = tile.referenceId.ifBlank { tile.id },
+                            title = tile.title,
+                            subtitle = tile.subtitle.ifBlank { "Playlist" },
+                            badge = "PLAYLIST",
+                            artworkUrl = tile.artworkUrl,
+                            trackCount = 20,
+                            seedQuery = tile.title
+                        )
+                    )
                 }
             }
             RecentTileKind.SPOTIFY_PLAYLIST -> {
-                val sp = _uiState.value.spotifyPlaylists.firstOrNull { it.id == tile.referenceId }
-                if (sp != null) {
-                    openSpotifyPlaylist(sp)
-                }
+                val cleanSpId = tile.referenceId
+                    .removePrefix("sp_carousel_")
+                    .removePrefix("sp_search_")
+                    .removePrefix("sp_pl_")
+                    .removePrefix("sp_")
+                    .ifBlank { tile.id.removePrefix("sp_") }
+                val sp = _uiState.value.spotifyPlaylists.firstOrNull {
+                    it.id == tile.referenceId || it.id == cleanSpId
+                } ?: SpotifyPlaylistSummary(
+                    id = cleanSpId,
+                    name = tile.title,
+                    description = tile.subtitle,
+                    imageUrl = tile.artworkUrl.takeIf { it.isNotBlank() },
+                    trackCount = 20,
+                    ownerName = tile.subtitle.ifBlank { "Spotify" }
+                )
+                openSpotifyPlaylist(sp)
             }
             RecentTileKind.CURATED_PLAYLIST -> {
+                if (tile.referenceId.startsWith("album_lookup_")) {
+                    val seedTrack = TrackItem(
+                        id = tile.referenceId,
+                        title = tile.title,
+                        artist = tile.subtitle.takeUnless { it.equals("ALBUM", true) }.orEmpty(),
+                        album = tile.title,
+                        artworkUrl = tile.artworkUrl,
+                        audioStreamUrl = null,
+                        durationMs = 210_000L,
+                        sourceType = AudioSourceType.YTM_ADFREE
+                    )
+                    openAlbumForTrack(seedTrack)
+                    return
+                }
+                if (tile.referenceId.startsWith("artist_lookup_")) {
+                    openArtistPage(tile.title, fallbackArtwork = tile.artworkUrl)
+                    return
+                }
                 val all = _uiState.value.suggestedPlaylists +
                     _uiState.value.spotifyCratePlaylists +
                     _uiState.value.ytmSessionPlaylists +
-                    _uiState.value.vinylPressingPlaylists
-                val cur = all.firstOrNull { it.id == tile.referenceId }
-                if (cur != null) {
-                    openCarouselPlaylist(cur)
-                }
+                    _uiState.value.vinylPressingPlaylists +
+                    _uiState.value.searchPlaylistsResults
+                val cur = all.firstOrNull {
+                    it.id == tile.referenceId || "cur_${it.id}" == tile.id
+                } ?: SuggestedPlaylist(
+                    id = tile.referenceId.ifBlank { tile.id.removePrefix("cur_") },
+                    title = tile.title,
+                    subtitle = tile.subtitle.ifBlank { "Curated Mix" },
+                    badge = tile.subtitle.ifBlank { "MIX" },
+                    artworkUrl = tile.artworkUrl,
+                    trackCount = 20,
+                    seedQuery = tile.title,
+                    externalPlaylistId = tile.referenceId.takeIf {
+                        it.startsWith("ytm_pl_") || it.startsWith("pl_saavn_") || it.startsWith("sp_")
+                    },
+                    isSpotifyPlaylist = tile.referenceId.startsWith("sp_"),
+                    isYoutubePlaylist = tile.referenceId.startsWith("ytm_")
+                )
+                openCarouselPlaylist(cur)
             }
         }
     }
@@ -1302,6 +1625,205 @@ class NothingChordViewModel(
         viewModelScope.launch {
             repository.deleteUserPlaylist(playlistId)
             emitFeedback("Playlist deleted")
+        }
+    }
+
+    private fun purgePlaylistFromUiLists(keys: Set<String>) {
+        _uiState.update { state ->
+            state.copy(
+                suggestedPlaylists = state.suggestedPlaylists.filterNot { pl ->
+                    pl.id in keys || "cur_${pl.id}" in keys || (pl.externalPlaylistId != null && pl.externalPlaylistId in keys)
+                },
+                spotifyCratePlaylists = state.spotifyCratePlaylists.filterNot { pl ->
+                    pl.id in keys || "cur_${pl.id}" in keys || (pl.externalPlaylistId != null && pl.externalPlaylistId in keys)
+                },
+                ytmSessionPlaylists = state.ytmSessionPlaylists.filterNot { pl ->
+                    pl.id in keys || "cur_${pl.id}" in keys || (pl.externalPlaylistId != null && pl.externalPlaylistId in keys)
+                },
+                vinylPressingPlaylists = state.vinylPressingPlaylists.filterNot { pl ->
+                    pl.id in keys || "cur_${pl.id}" in keys || (pl.externalPlaylistId != null && pl.externalPlaylistId in keys)
+                }
+            )
+        }
+    }
+
+    fun removeRecentTileFromHome(tile: RecentGridTile) {
+        triggerConfirmHaptic()
+        val ref = tile.referenceId.trim()
+        val keys = buildSet {
+            add(tile.id)
+            if (ref.isNotEmpty()) {
+                add(ref)
+                add("cur_$ref")
+                add("sp_$ref")
+                add("upl_$ref")
+            }
+        }
+        purgePlaylistFromUiLists(keys)
+        viewModelScope.launch {
+            repository.removePlaylistFromHome(
+                keysToHide = keys,
+                recentId = tile.id,
+                referenceId = ref.ifEmpty { null }
+            )
+            emitFeedback("Removed from Home • ${tile.title}")
+        }
+    }
+
+    fun deleteRecentTilePlaylist(tile: RecentGridTile) {
+        triggerConfirmHaptic()
+        val ref = tile.referenceId.trim()
+        val userPlId = if (tile.kind == RecentTileKind.USER_PLAYLIST) {
+            ref.ifBlank { tile.id.removePrefix("upl_") }
+        } else null
+        val keys = buildSet {
+            add(tile.id)
+            if (ref.isNotEmpty()) {
+                add(ref)
+                add("cur_$ref")
+                add("sp_$ref")
+                add("upl_$ref")
+            }
+        }
+        purgePlaylistFromUiLists(keys)
+        if (tile.kind == RecentTileKind.SPOTIFY_PLAYLIST) {
+            val cleanSp = ref.removePrefix("sp_carousel_").removePrefix("sp_").ifBlank { tile.id.removePrefix("sp_") }
+            _uiState.update { s ->
+                s.copy(spotifyPlaylists = s.spotifyPlaylists.filterNot { it.id == cleanSp || it.id == ref })
+            }
+        }
+        viewModelScope.launch {
+            if (!userPlId.isNullOrBlank()) {
+                repository.deleteUserPlaylist(userPlId)
+                repository.removePlaylistFromHome(keysToHide = keys, recentId = tile.id, referenceId = userPlId)
+            } else {
+                repository.deleteExternalOrCuratedPlaylist(
+                    keysToHide = keys,
+                    recentId = tile.id,
+                    referenceId = ref.ifEmpty { null },
+                    pinKey = tile.id
+                )
+            }
+            emitFeedback("Deleted playlist • ${tile.title}")
+        }
+    }
+
+    fun removeCarouselPlaylistFromHome(playlist: SuggestedPlaylist) {
+        triggerConfirmHaptic()
+        val keys = buildSet {
+            add(playlist.id)
+            add("cur_${playlist.id}")
+            add("sp_${playlist.id}")
+            playlist.externalPlaylistId?.takeIf { it.isNotBlank() }?.let { ext ->
+                add(ext)
+                add("cur_$ext")
+                add("sp_$ext")
+            }
+        }
+        purgePlaylistFromUiLists(keys)
+        viewModelScope.launch {
+            repository.removePlaylistFromHome(
+                keysToHide = keys,
+                recentId = "cur_${playlist.id}",
+                referenceId = playlist.id
+            )
+            emitFeedback("Removed from Home • ${playlist.title}")
+        }
+    }
+
+    fun deleteCarouselPlaylistCompletely(playlist: SuggestedPlaylist) {
+        triggerConfirmHaptic()
+        val extId = playlist.externalPlaylistId?.trim().orEmpty()
+        val cleanSp = extId.removePrefix("sp_").ifBlank { playlist.id.removePrefix("sp_carousel_").removePrefix("sp_") }
+        val keys = buildSet {
+            add(playlist.id)
+            add("cur_${playlist.id}")
+            add("sp_${playlist.id}")
+            if (extId.isNotEmpty()) {
+                add(extId)
+                add("cur_$extId")
+                add("sp_$extId")
+            }
+            if (cleanSp.isNotEmpty()) {
+                add(cleanSp)
+                add("sp_$cleanSp")
+            }
+        }
+        purgePlaylistFromUiLists(keys)
+        _uiState.update { s ->
+            s.copy(spotifyPlaylists = s.spotifyPlaylists.filterNot { it.id == cleanSp || it.id == playlist.id })
+        }
+        viewModelScope.launch {
+            userPlaylists.value.firstOrNull {
+                it.id == playlist.id ||
+                    (!it.spotifyPlaylistId.isNullOrBlank() && it.spotifyPlaylistId == cleanSp) ||
+                    (!it.youtubePlaylistId.isNullOrBlank() && it.youtubePlaylistId == extId)
+            }?.let { matchedUserPl ->
+                repository.deleteUserPlaylist(matchedUserPl.id)
+            }
+            repository.deleteExternalOrCuratedPlaylist(
+                keysToHide = keys,
+                recentId = "cur_${playlist.id}",
+                referenceId = playlist.id,
+                pinKey = "cur_${playlist.id}"
+            )
+            emitFeedback("Deleted playlist • ${playlist.title}")
+        }
+    }
+
+    fun removeOrDeleteActiveCollectionPage(page: CollectionPageState, deletePermanently: Boolean) {
+        triggerConfirmHaptic()
+        val userPid = page.userPlaylistId
+        val spPid = page.spotifyPlaylistId
+        val keys = buildSet {
+            add(page.id)
+            add("cur_${page.id}")
+            add("sp_${page.id}")
+            if (!userPid.isNullOrBlank()) {
+                add(userPid)
+                add("upl_$userPid")
+            }
+            if (!spPid.isNullOrBlank()) {
+                add(spPid)
+                add("sp_$spPid")
+                add("sp_carousel_$spPid")
+            }
+        }
+        purgePlaylistFromUiLists(keys)
+        if (deletePermanently && !spPid.isNullOrBlank()) {
+            _uiState.update { s ->
+                s.copy(spotifyPlaylists = s.spotifyPlaylists.filterNot { it.id == spPid })
+            }
+        }
+        viewModelScope.launch {
+            if (deletePermanently && !userPid.isNullOrBlank()) {
+                repository.deleteUserPlaylist(userPid)
+            }
+            if (deletePermanently) {
+                repository.deleteExternalOrCuratedPlaylist(
+                    keysToHide = keys,
+                    recentId = page.id,
+                    referenceId = userPid ?: spPid ?: page.id,
+                    pinKey = if (!userPid.isNullOrBlank()) "upl_$userPid" else "sp_${spPid ?: page.id}"
+                )
+                emitFeedback("Deleted • ${page.title}")
+            } else {
+                repository.removePlaylistFromHome(
+                    keysToHide = keys,
+                    recentId = page.id,
+                    referenceId = userPid ?: spPid ?: page.id
+                )
+                emitFeedback("Removed from Home • ${page.title}")
+            }
+        }
+    }
+
+    fun restoreHiddenHomePlaylists() {
+        triggerConfirmHaptic()
+        viewModelScope.launch {
+            repository.restoreHiddenHomePlaylists()
+            loadInitialDiscoverFeeds()
+            emitFeedback("Restored hidden Home playlists")
         }
     }
 
@@ -1563,9 +2085,21 @@ class NothingChordViewModel(
         if (_uiState.value.activeCollectionPage != null) {
             activeUserPlaylistObserverJob?.cancel()
             _uiState.update { it.copy(collectionStack = emptyList()) }
-            if (_uiState.value.activeTab == tab) return
+            if (_uiState.value.activeTab == tab) {
+                if (tab == NothingTab.SEARCH) {
+                    triggerHaptic()
+                    _uiState.update { it.copy(searchKeyboardRequestNonce = it.searchKeyboardRequestNonce + 1) }
+                }
+                return
+            }
         }
-        if (_uiState.value.activeTab == tab) return
+        if (_uiState.value.activeTab == tab) {
+            if (tab == NothingTab.SEARCH) {
+                triggerHaptic()
+                _uiState.update { it.copy(searchKeyboardRequestNonce = it.searchKeyboardRequestNonce + 1) }
+            }
+            return
+        }
         triggerHaptic()
         _uiState.update { it.copy(activeTab = tab) }
     }
@@ -1726,10 +2260,13 @@ class NothingChordViewModel(
         if (uri.scheme == "nothingchord" && uri.host == "callback") {
             val error = uri.getQueryParameter("error")
             val code = uri.getQueryParameter("code")
+            val returnedState = uri.getQueryParameter("state")
             if (!error.isNullOrBlank()) {
+                viewModelScope.launch { repository.abortSpotifyHandshake() }
                 _uiState.update {
                     it.copy(
                         isAccountPageOpen = true,
+                        isSpotifyLoading = false,
                         spotifyStatusBanner = "Authorization cancelled ($error)"
                     )
                 }
@@ -1737,7 +2274,6 @@ class NothingChordViewModel(
             }
             if (!code.isNullOrBlank()) {
                 viewModelScope.launch {
-                    repository.completeOnboarding()
                     _uiState.update {
                         it.copy(
                             isAccountPageOpen = true,
@@ -1745,15 +2281,25 @@ class NothingChordViewModel(
                             spotifyStatusBanner = "Connecting Spotify PKCE…"
                         )
                     }
-                    val exchange = repository.handleSpotifyOAuthCode(code)
+                    val exchange = repository.handleSpotifyOAuthCode(
+                        code = code,
+                        returnedState = returnedState
+                    )
                     if (exchange.isSuccess) {
+                        repository.completeOnboarding()
                         emitFeedback("Spotify Connected & Syncing")
                         syncSpotifyData()
                     } else {
+                        val err = exchange.exceptionOrNull()
+                        val banner = if (err is SecurityException) {
+                            "Security check failed (state mismatch). Please start Connect Spotify again."
+                        } else {
+                            "Token exchange failed. Verify Redirect URI nothingchord://callback"
+                        }
                         _uiState.update {
                             it.copy(
                                 isSpotifyLoading = false,
-                                spotifyStatusBanner = "Token exchange failed. Verify Redirect URI nothingchord://callback"
+                                spotifyStatusBanner = banner
                             )
                         }
                     }
@@ -1890,6 +2436,23 @@ class NothingChordViewModel(
                 resolved = repository.resolvePlayableStream(track, forceAlternate = true, attemptIndex = 2)
             }
 
+            if (resolved.url.isNullOrBlank()) {
+                repository.markTrackUnplayable(track.id)
+                emitFeedback("Unavailable • ${track.title}")
+                lyricsJob.cancel()
+                val nextPlayable = effectiveQueue.drop(idx + 1).firstOrNull { candidate ->
+                    candidate.id !in unplayableTrackIds.value || candidate.id in downloadedTrackIds.value
+                }
+                if (nextPlayable != null) {
+                    playTrackFromContext(nextPlayable, effectiveQueue, silentFeedback = true)
+                }
+                return@launch
+            }
+
+            if (track.id in unplayableTrackIds.value) {
+                launch { repository.clearTrackUnplayable(track.id) }
+            }
+
             val isOfflineVaultPlay = resolved.containerLabel == "IN-APP VAULT" ||
                 track.id in downloadedTrackIds.value
             val enrichedTrack = track.copy(
@@ -1900,7 +2463,8 @@ class NothingChordViewModel(
                 } else {
                     "${resolved.codecLabel} • ${resolved.bitrateKbps}k"
                 },
-                isDownloaded = isOfflineVaultPlay
+                isDownloaded = isOfflineVaultPlay,
+                isPlayable = true
             )
             audioEngine.playTrack(
                 track = enrichedTrack,
@@ -1923,6 +2487,16 @@ class NothingChordViewModel(
                         RecentTileKind.SPOTIFY_PLAYLIST,
                         activePage.spotifyPlaylistId.orEmpty()
                     )
+                    CollectionPageType.ALBUM -> Triple(
+                        "alb_${activePage.id.removePrefix("album_lookup_")}",
+                        RecentTileKind.ALBUM,
+                        activePage.id
+                    )
+                    CollectionPageType.ARTIST -> Triple(
+                        "art_${activePage.id.removePrefix("artist_lookup_")}",
+                        RecentTileKind.ARTIST,
+                        activePage.id
+                    )
                     else -> Triple(
                         "cur_${activePage.id.removePrefix("col_")}",
                         RecentTileKind.CURATED_PLAYLIST,
@@ -1930,11 +2504,16 @@ class NothingChordViewModel(
                     )
                 }
                 if (refId.isNotBlank()) {
+                    val subtitleToSave = when (activePage.type) {
+                        CollectionPageType.ALBUM -> activePage.artistNameForNav ?: activePage.subtitle
+                        CollectionPageType.ARTIST -> "ARTIST"
+                        else -> activePage.badge
+                    }
                     launch {
                         repository.recordRecentCollectionPlay(
                             id = tileId,
                             title = activePage.title,
-                            subtitle = activePage.badge,
+                            subtitle = subtitleToSave,
                             artworkUrl = activePage.artworkUrl.ifBlank { enrichedTrack.artworkUrl },
                             kind = kind,
                             referenceId = refId
@@ -1966,7 +2545,12 @@ class NothingChordViewModel(
     private fun retryWithAlternateEngine(failedTrack: TrackItem) {
         viewModelScope.launch {
             val nextAttempt = streamRetryAttempt + 1
-            if (nextAttempt > 3) return@launch
+            if (nextAttempt > 3) {
+                repository.markTrackUnplayable(failedTrack.id)
+                emitFeedback("Unavailable • ${failedTrack.title}")
+                skipNext()
+                return@launch
+            }
             streamRetryAttempt = nextAttempt
             val currentSettings = glyphSettings.value
             val altResolved = repository.resolvePlayableStream(
@@ -1987,6 +2571,10 @@ class NothingChordViewModel(
                     bitPerfectUsb = currentSettings.bitPerfectUsbDac,
                     allowRetryCallback = nextAttempt < 3
                 )
+            } else if (nextAttempt >= 3) {
+                repository.markTrackUnplayable(failedTrack.id)
+                emitFeedback("Unavailable • ${failedTrack.title}")
+                skipNext()
             }
         }
     }
@@ -2032,15 +2620,27 @@ class NothingChordViewModel(
         val state = _uiState.value
         val q = state.queue
         if (q.isEmpty()) return
+        val unplayable = unplayableTrackIds.value
+        val downloaded = downloadedTrackIds.value
+
+        fun isPlayableCandidate(index: Int): Boolean {
+            val item = q[index]
+            return (item.isPlayable && item.id !in unplayable) || item.id in downloaded || item.isDownloaded
+        }
 
         val nextIdx = if (state.shuffleEnabled && q.size > 1) {
-            q.indices.filter { it != state.currentQueueIndex }.random()
+            val pool = q.indices.filter { it != state.currentQueueIndex && isPlayableCandidate(it) }
+            if (pool.isNotEmpty()) pool.random() else return
         } else {
-            val candidate = state.currentQueueIndex + 1
+            var candidate = state.currentQueueIndex + 1
+            while (candidate < q.size && !isPlayableCandidate(candidate)) {
+                candidate++
+            }
             if (candidate < q.size) {
                 candidate
             } else if (state.repeatMode == RepeatModeState.ALL) {
-                0
+                val wrapped = q.indices.firstOrNull { isPlayableCandidate(it) } ?: return
+                wrapped
             } else {
                 if (glyphSettings.value.automixEnabled) {
                     triggerAutomixExtension(q.last())
@@ -2081,9 +2681,21 @@ class NothingChordViewModel(
 
     private fun triggerAutomixExtension(seedTrack: TrackItem) {
         viewModelScope.launch {
-            val relatedRes = repository.searchStreamingCatalog(seedTrack.artist, limit = 10)
+            val tasteLead = userTasteProfile.value.topAffinityArtists
+                .firstOrNull { !it.equals(seedTrack.artist.substringBefore(",").trim(), ignoreCase = true) }
+            val seedRes = repository.searchStreamingCatalog(seedTrack.artist, limit = 10).getOrDefault(emptyList())
+            val tasteRes = if (!tasteLead.isNullOrBlank()) {
+                repository.searchStreamingCatalog(tasteLead, limit = 6).getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
             val existingIds = _uiState.value.queue.map { it.id }.toSet()
-            val freshTracks = relatedRes.getOrDefault(emptyList()).filter { it.id !in existingIds }
+            val candidatePool = (seedRes + tasteRes).filter { it.id !in existingIds }
+            val freshTracks = com.example.domain.TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                tracks = candidatePool,
+                profile = userTasteProfile.value,
+                unplayableIds = unplayableTrackIds.value
+            )
             if (freshTracks.isNotEmpty()) {
                 val expandedQueue = _uiState.value.queue + freshTracks
                 playTrackFromContext(freshTracks.first(), expandedQueue, silentFeedback = true)
@@ -2191,6 +2803,28 @@ class NothingChordViewModel(
         viewModelScope.launch { repository.setTactileHaptics(enabled) }
     }
 
+    fun setHideUnplayableSongs(enabled: Boolean) {
+        triggerHaptic()
+        emitFeedback(if (enabled) "Unplayable songs hidden" else "Unplayable songs dimmed")
+        viewModelScope.launch { repository.setHideUnplayableSongs(enabled) }
+    }
+
+    fun setDisplayRefreshPolicy(policy: com.example.data.model.DisplayRefreshPolicy) {
+        triggerHaptic()
+        emitFeedback("Refresh rate • ${policy.label}")
+        viewModelScope.launch { repository.setDisplayRefreshPolicy(policy) }
+    }
+
+    fun onVisualizerPermissionResult(granted: Boolean) {
+        triggerHaptic()
+        if (granted) {
+            audioEngine.refreshVisualizerAttachment()
+            emitFeedback("Live 6-band hardware FFT enabled")
+        } else {
+            emitFeedback("Using tempo-seeded groove fallback")
+        }
+    }
+
     fun triggerHaptic() {
         audioEngine.triggerDetentHaptic(glyphSettings.value.tactileHaptics)
     }
@@ -2210,6 +2844,7 @@ class NothingChordViewModel(
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
                     val appCtx = context.applicationContext
+                    com.example.data.remote.NetworkModule.initializeRuntimeCaches(appCtx)
                     val db = NothingChordDatabase.getInstance(appCtx)
                     val prefs = NothingPreferencesStore(appCtx)
                     val dlManager = InAppDownloadManager(appCtx)

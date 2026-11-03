@@ -58,11 +58,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import com.example.data.model.CollectionPageState
 import com.example.data.model.CollectionPageType
 import com.example.data.model.SuggestedPlaylist
 import com.example.data.model.TrackItem
 import com.example.ui.components.NothingPlaylistMosaicCover
+import com.example.ui.components.NothingSlowMarqueeText
 import com.example.ui.components.NothingTrackRow
 import com.example.ui.components.PlaylistEditorDialog
 
@@ -77,6 +80,8 @@ fun CollectionDetailScreen(
     savedIds: Set<String>,
     downloadedTrackIds: Set<String> = emptySet(),
     downloadProgress: Map<String, Float> = emptyMap(),
+    unplayableTrackIds: Set<String> = emptySet(),
+    hideUnplayableSongs: Boolean = false,
     onBack: () -> Unit,
     onPlayTrack: (TrackItem, List<TrackItem>) -> Unit,
     onToggleSave: (TrackItem) -> Unit,
@@ -90,14 +95,46 @@ fun CollectionDetailScreen(
     onDeleteUserPlaylist: (playlistId: String) -> Unit,
     onMovePlaylistTrack: (playlistId: String, fromIdx: Int, toIdx: Int) -> Unit,
     onRemovePlaylistTrack: (playlistId: String, trackId: String) -> Unit,
+    onRemoveCollectionFromHome: ((CollectionPageState) -> Unit)? = null,
+    onDeleteCollectionPermanently: ((CollectionPageState) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     BackHandler(onBack = onBack)
 
     val isUserPlaylist = page.type == CollectionPageType.USER_PLAYLIST && page.userPlaylistId != null
     val isArtist = page.type == CollectionPageType.ARTIST
+    val isManageablePlaylist = page.type == CollectionPageType.USER_PLAYLIST ||
+        page.type == CollectionPageType.CURATED_PLAYLIST ||
+        page.type == CollectionPageType.SPOTIFY_PLAYLIST ||
+        page.type == CollectionPageType.YOUTUBE_PLAYLIST
     var isReorderMode by remember(page.id) { mutableStateOf(false) }
     var showMetadataEditor by remember { mutableStateOf(false) }
+    var showRemoveDeleteDialog by remember { mutableStateOf(false) }
+
+    val displayedTracks = remember(
+        page.tracks,
+        unplayableTrackIds,
+        downloadedTrackIds,
+        hideUnplayableSongs,
+        isReorderMode
+    ) {
+        if (!hideUnplayableSongs || isReorderMode) {
+            page.tracks
+        } else {
+            page.tracks.filter { track ->
+                (track.isPlayable && track.id !in unplayableTrackIds) ||
+                    track.id in downloadedTrackIds ||
+                    track.isDownloaded
+            }
+        }
+    }
+    val playableTracks = remember(displayedTracks, unplayableTrackIds, downloadedTrackIds) {
+        displayedTracks.filter { track ->
+            (track.isPlayable && track.id !in unplayableTrackIds) ||
+                track.id in downloadedTrackIds ||
+                track.isDownloaded
+        }
+    }
 
     if (showMetadataEditor && isUserPlaylist) {
         val pid = page.userPlaylistId!!
@@ -112,6 +149,78 @@ fun CollectionDetailScreen(
             onDeletePlaylist = {
                 onDeleteUserPlaylist(pid)
                 onBack()
+            }
+        )
+    }
+
+    if (showRemoveDeleteDialog && isManageablePlaylist) {
+        AlertDialog(
+            onDismissRequest = { showRemoveDeleteDialog = false },
+            containerColor = MaterialTheme.colorScheme.surface,
+            title = {
+                Text(
+                    text = page.title,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Hide this playlist from your Home shelves or delete it completely from NChord.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (onRemoveCollectionFromHome != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                                .clickable {
+                                    showRemoveDeleteDialog = false
+                                    onRemoveCollectionFromHome(page)
+                                    onBack()
+                                }
+                                .padding(horizontal = 14.dp, vertical = 12.dp)
+                                .testTag("collection_action_remove_home")
+                        ) {
+                            Text(
+                                text = "Remove from Home",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                    if (onDeleteCollectionPermanently != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f))
+                                .clickable {
+                                    showRemoveDeleteDialog = false
+                                    onDeleteCollectionPermanently(page)
+                                    onBack()
+                                }
+                                .padding(horizontal = 14.dp, vertical = 12.dp)
+                                .testTag("collection_action_delete")
+                        ) {
+                            Text(
+                                text = "Delete Playlist",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showRemoveDeleteDialog = false }) {
+                    Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         )
     }
@@ -207,31 +316,75 @@ fun CollectionDetailScreen(
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                             }
+
+                            if (onRemoveCollectionFromHome != null || onDeleteCollectionPermanently != null) {
+                                IconButton(
+                                    onClick = { showRemoveDeleteDialog = true },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.surface)
+                                        .testTag("collection_remove_or_delete_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.DeleteOutline,
+                                        contentDescription = "Manage or delete playlist",
+                                        tint = MaterialTheme.colorScheme.onBackground,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
                         }
-                    } else if (!isArtist && page.tracks.isNotEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.surface)
-                                .clickable { onSaveCollectionToLibrary(page) }
-                                .padding(horizontal = 14.dp, vertical = 8.dp)
-                                .testTag("save_collection_to_library_button"),
-                            contentAlignment = Alignment.Center
+                    } else if (!isArtist) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.onBackground,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "Save Playlist",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = MaterialTheme.colorScheme.onBackground
-                                )
+                            if (page.tracks.isNotEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.surface)
+                                        .clickable { onSaveCollectionToLibrary(page) }
+                                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                                        .testTag("save_collection_to_library_button"),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onBackground,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "Save Playlist",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = MaterialTheme.colorScheme.onBackground
+                                        )
+                                    }
+                                }
+                            }
+                            if (isManageablePlaylist &&
+                                (onRemoveCollectionFromHome != null || onDeleteCollectionPermanently != null)
+                            ) {
+                                IconButton(
+                                    onClick = { showRemoveDeleteDialog = true },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.surface)
+                                        .testTag("collection_remove_or_delete_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.DeleteOutline,
+                                        contentDescription = "Remove or delete playlist",
+                                        tint = MaterialTheme.colorScheme.onBackground,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -286,12 +439,11 @@ fun CollectionDetailScreen(
                             color = MaterialTheme.colorScheme.primary
                         )
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text(
+                        NothingSlowMarqueeText(
                             text = page.title,
                             style = MaterialTheme.typography.headlineMedium,
                             color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
+                            modifier = Modifier.fillMaxWidth()
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         val clickableArtist = page.type == CollectionPageType.ALBUM &&
@@ -320,11 +472,12 @@ fun CollectionDetailScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(
                         onClick = {
-                            if (page.tracks.isNotEmpty()) {
-                                onPlayTrack(page.tracks.first(), page.tracks)
+                            val queueSource = playableTracks.ifEmpty { displayedTracks }
+                            if (queueSource.isNotEmpty()) {
+                                onPlayTrack(queueSource.first(), queueSource)
                             }
                         },
-                        enabled = page.tracks.isNotEmpty(),
+                        enabled = displayedTracks.isNotEmpty(),
                         shape = CircleShape,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.onBackground,
@@ -339,12 +492,13 @@ fun CollectionDetailScreen(
 
                     Button(
                         onClick = {
-                            if (page.tracks.isNotEmpty()) {
-                                val shuffled = page.tracks.shuffled()
+                            val queueSource = playableTracks.ifEmpty { displayedTracks }
+                            if (queueSource.isNotEmpty()) {
+                                val shuffled = queueSource.shuffled()
                                 onPlayTrack(shuffled.first(), shuffled)
                             }
                         },
-                        enabled = page.tracks.isNotEmpty(),
+                        enabled = displayedTracks.isNotEmpty(),
                         shape = CircleShape,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.surface,
@@ -357,9 +511,9 @@ fun CollectionDetailScreen(
                         Text("Shuffle", style = MaterialTheme.typography.labelLarge)
                     }
 
-                    if (onDownloadAll != null && page.tracks.isNotEmpty()) {
-                        val allDownloaded = page.tracks.all { it.id in downloadedTrackIds }
-                        val anyDownloading = page.tracks.any { downloadProgress.containsKey(it.id) }
+                    if (onDownloadAll != null && displayedTracks.isNotEmpty()) {
+                        val allDownloaded = displayedTracks.all { it.id in downloadedTrackIds }
+                        val anyDownloading = displayedTracks.any { downloadProgress.containsKey(it.id) }
                         IconButton(
                             onClick = onDownloadAll,
                             modifier = Modifier
@@ -415,7 +569,7 @@ fun CollectionDetailScreen(
                     )
                 }
             }
-        } else if (page.tracks.isEmpty()) {
+        } else if (displayedTracks.isEmpty()) {
             item(key = "collection_empty") {
                 Column(
                     modifier = Modifier
@@ -431,7 +585,11 @@ fun CollectionDetailScreen(
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "No songs in this playlist yet. Long-press any song across Nchord to add it here.",
+                        text = if (page.tracks.isNotEmpty() && hideUnplayableSongs) {
+                            "All songs in this crate are currently unavailable and hidden by your playback settings."
+                        } else {
+                            "No songs in this playlist yet. Long-press any song across Nchord to add it here."
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -439,8 +597,9 @@ fun CollectionDetailScreen(
             }
         } else {
             itemsIndexed(
-                items = page.tracks,
-                key = { idx, track -> "${page.id}_${idx}_${track.id}" }
+                items = displayedTracks,
+                key = { idx, track -> "${page.id}_${idx}_${track.id}" },
+                contentType = { _, _ -> if (isUserPlaylist && isReorderMode) "reorder_track_row" else "track_row" }
             ) { idx, track ->
                 if (isUserPlaylist && isReorderMode) {
                     val pid = page.userPlaylistId!!
@@ -492,14 +651,17 @@ fun CollectionDetailScreen(
                         }
                     }
                 } else {
+                    val isDownloaded = track.id in downloadedTrackIds || track.isDownloaded
+                    val isUnplayable = (!track.isPlayable || track.id in unplayableTrackIds) && !isDownloaded
                     NothingTrackRow(
                         track = track,
                         isCurrentTrack = track.id == currentTrackId,
                         isPlaying = isPlaying && track.id == currentTrackId,
                         isSaved = track.id in savedIds,
-                        isDownloaded = track.id in downloadedTrackIds || track.isDownloaded,
+                        isDownloaded = isDownloaded,
+                        isUnplayable = isUnplayable,
                         downloadProgress = downloadProgress[track.id],
-                        onPlayClick = { onPlayTrack(track, page.tracks) },
+                        onPlayClick = { onPlayTrack(track, displayedTracks) },
                         onToggleSave = { onToggleSave(track) },
                         onLongClick = { onLongClickTrack(track, page.userPlaylistId) },
                         onSwipeAddToQueue = { onSwipeAddToQueue(track) },

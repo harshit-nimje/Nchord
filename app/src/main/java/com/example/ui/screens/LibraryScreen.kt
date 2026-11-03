@@ -91,6 +91,8 @@ fun LibraryScreen(
     currentTrackId: String?,
     isPlaying: Boolean,
     savedIds: Set<String>,
+    unplayableTrackIds: Set<String> = emptySet(),
+    hideUnplayableSongs: Boolean = false,
     onTogglePinItem: (itemKey: String, label: String) -> Unit,
     onDeleteUserPlaylist: (UserPlaylist) -> Unit,
     onOpenUserPlaylist: (UserPlaylist) -> Unit,
@@ -315,11 +317,28 @@ fun LibraryScreen(
                     onImportUrlClick = { showImportUrlDialog = true }
                 )
             } else {
-                val displayedList = when (segment) {
+                val rawList = when (segment) {
                     1 -> downloadedTracks
                     2 -> savedTracks
                     3 -> recentScrobbles
                     else -> localImportedTracks
+                }
+                val displayedList = remember(
+                    rawList,
+                    segment,
+                    unplayableTrackIds,
+                    downloadedTrackIds,
+                    hideUnplayableSongs
+                ) {
+                    if (!hideUnplayableSongs || segment == 1 || segment == 4) {
+                        rawList
+                    } else {
+                        rawList.filter { track ->
+                            (track.isPlayable && track.id !in unplayableTrackIds) ||
+                                track.id in downloadedTrackIds ||
+                                track.isDownloaded
+                        }
+                    }
                 }
 
                 if (displayedList.isEmpty()) {
@@ -359,13 +378,21 @@ fun LibraryScreen(
                         contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 192.dp),
                         verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
-                        items(displayedList, key = { "${segment}_${it.id}" }) { track ->
+                        items(
+                            items = displayedList,
+                            key = { "${segment}_${it.id}" },
+                            contentType = { "track_row" }
+                        ) { track ->
+                            val isDownloaded = track.id in downloadedTrackIds || track.isDownloaded
+                            val isUnplayable = (!track.isPlayable || track.id in unplayableTrackIds) &&
+                                !isDownloaded && segment != 4
                             NothingTrackRow(
                                 track = track,
                                 isCurrentTrack = track.id == currentTrackId,
                                 isPlaying = isPlaying && track.id == currentTrackId,
                                 isSaved = track.id in savedIds,
-                                isDownloaded = track.id in downloadedTrackIds,
+                                isDownloaded = isDownloaded,
+                                isUnplayable = isUnplayable,
                                 downloadProgress = downloadProgress[track.id],
                                 onPlayClick = { onPlayTrack(track, displayedList) },
                                 onToggleSave = { onToggleSave(track) },
@@ -425,7 +452,11 @@ private fun PlaylistsLibraryView(
             )
         }.sortedByDescending { it.first in pinnedKeys }
 
-        items(smartItems, key = { it.first }) { (key, title, subtitle) ->
+        items(
+            items = smartItems,
+            key = { it.first },
+            contentType = { "smart_vault_row" }
+        ) { (key, title, subtitle) ->
             val isPinned = key in pinnedKeys
             val isDownloads = key == "smart_downloads"
             Row(
@@ -542,7 +573,11 @@ private fun PlaylistsLibraryView(
         }
 
         if (userPlaylists.isNotEmpty()) {
-            items(userPlaylists, key = { "upl_${it.id}" }) { pl ->
+            items(
+                items = userPlaylists,
+                key = { "upl_${it.id}" },
+                contentType = { "user_playlist_row" }
+            ) { pl ->
                 val pinKey = "upl_${pl.id}"
                 val isPinned = pl.isPinned || pinKey in pinnedKeys
                 Row(
@@ -646,7 +681,11 @@ private fun PlaylistsLibraryView(
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                 )
             }
-            items(sortedSpotify, key = { "sp_lib_${it.id}" }) { sp ->
+            items(
+                items = sortedSpotify,
+                key = { "sp_lib_${it.id}" },
+                contentType = { "spotify_playlist_row" }
+            ) { sp ->
                 val pinKey = "sp_${sp.id}"
                 val isPinned = pinKey in pinnedKeys
                 Row(

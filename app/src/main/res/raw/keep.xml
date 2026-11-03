@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:discard="@drawable/img_glyph_hero_banner,@drawable/img_nothingchord_icon" />

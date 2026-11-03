@@ -1,5 +1,7 @@
 package com.example.data.remote
 
+import android.annotation.SuppressLint
+import android.util.Base64
 import android.util.LruCache
 import com.example.data.model.AudioQualityTier
 import com.example.data.model.AudioSourceType
@@ -15,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -66,6 +69,7 @@ object FullStreamEngine {
     private val playlistListCache = LruCache<String, List<SuggestedPlaylist>>(32)
     private val playlistTracksCache = LruCache<String, List<TrackItem>>(40)
     private val resolvedStreamCache = LruCache<String, ResolvedStreamResult>(160)
+    private val playabilityProbeCache = LruCache<String, Boolean>(512)
 
     private fun buildSaavnRequest(url: String): Request {
         val geoIp = SAAVN_GEO_IPS[(url.hashCode() and 0x7FFFFFFF) % SAAVN_GEO_IPS.size]
@@ -83,6 +87,72 @@ object FullStreamEngine {
 
     fun getCachedStream(trackId: String, tier: AudioQualityTier): ResolvedStreamResult? =
         resolvedStreamCache.get("${trackId}_${tier.id}")
+
+    /**
+     * Lightweight background playability check that detects unplayable tracks beforehand
+     * and caches verified direct streams for instant zero-lag playback.
+     */
+    suspend fun quickProbeTrackPlayable(
+        track: TrackItem,
+        qualityTier: AudioQualityTier = AudioQualityTier.LOSSLESS_LDAC
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!track.isPlayable) {
+            playabilityProbeCache.put(track.id, false)
+            return@withContext false
+        }
+        if (track.isDownloaded || track.sourceType == AudioSourceType.LOCAL_FILE) {
+            return@withContext true
+        }
+        playabilityProbeCache.get(track.id)?.let { return@withContext it }
+
+        val cacheKey = "${track.id}_${qualityTier.id}"
+        resolvedStreamCache.get(cacheKey)?.let { cached ->
+            if (!cached.url.isNullOrBlank()) {
+                playabilityProbeCache.put(track.id, true)
+                return@withContext true
+            }
+        }
+
+        val probeResult = runCatching {
+            val direct = track.audioStreamUrl
+            if (!direct.isNullOrBlank() && direct.contains("saavncdn.com")) {
+                val verified = resolveVerifiedSaavnStream(direct, track.durationMs, qualityTier)
+                if (verified != null && !verified.url.isNullOrBlank()) {
+                    resolvedStreamCache.put(cacheKey, verified)
+                    return@runCatching true
+                }
+            }
+            val cleanTitle = stripEditionNoise(track.title)
+            val cleanArtist = primaryArtistOf(track.artist)
+            if (cleanTitle.isBlank()) return@runCatching false
+
+            val saavnHits = searchSaavnDirect("$cleanTitle $cleanArtist", limit = 4, qualityTier = qualityTier)
+            if (saavnHits.isNotEmpty()) {
+                val best = pickBestCanonicalTrack(
+                    candidates = saavnHits,
+                    targetTitle = track.title,
+                    targetArtist = track.artist,
+                    targetAlbum = track.album,
+                    targetDurationMs = track.durationMs,
+                    minimumScore = 20
+                ) ?: saavnHits.firstOrNull()
+                if (best != null && !best.audioStreamUrl.isNullOrBlank()) {
+                    return@runCatching true
+                }
+            }
+
+            val ytmVid = track.youtubeVideoId ?: findCanonicalInnerTubeVideoId(
+                title = track.title,
+                artist = track.artist,
+                album = track.album,
+                targetDurationMs = track.durationMs
+            )
+            !ytmVid.isNullOrBlank()
+        }.getOrDefault(true) // Never mark false on transient offline/network hiccups
+
+        playabilityProbeCache.put(track.id, probeResult)
+        probeResult
+    }
 
     /**
      * Searches full-length songs with sub-second response, canonical studio album ranking,
@@ -302,17 +372,34 @@ object FullStreamEngine {
         if (playlist.preloadedTracks.isNotEmpty()) return@withContext playlist.preloadedTracks
         playlistTracksCache.get(playlist.id)?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
 
-        if (playlist.isYoutubePlaylist && !playlist.externalPlaylistId.isNullOrBlank()) {
-            val ytmTracks = fetchInnerTubePlaylistTracks(playlist.externalPlaylistId)
+        val cleanExtId = playlist.externalPlaylistId
+            ?.trim()
+            ?.removePrefix("ytm_pl_")
+            ?.removePrefix("pl_saavn_")
+            ?.removePrefix("sp_carousel_")
+            ?.removePrefix("sp_search_")
+            ?.removePrefix("sp_pl_")
+            ?.removePrefix("sp_")
+            ?.takeIf { it.isNotBlank() }
+
+        if (playlist.isYoutubePlaylist && !cleanExtId.isNullOrBlank()) {
+            val ytmTracks = fetchInnerTubePlaylistTracks(cleanExtId)
             if (ytmTracks.isNotEmpty()) {
                 playlistTracksCache.put(playlist.id, ytmTracks)
                 return@withContext ytmTracks
             }
         }
 
-        val extId = playlist.externalPlaylistId
-        if (!extId.isNullOrBlank()) {
-            val url = "$SAAVN_BASE?__call=playlist.getDetails&api_version=4&_format=json&_marker=0&ctx=web6dot0&listid=$extId"
+        if (playlist.isSpotifyPlaylist && !cleanExtId.isNullOrBlank()) {
+            val spEmbedTracks = fetchPublicSpotifyEmbedPlaylist("playlist", cleanExtId).third
+            if (spEmbedTracks.isNotEmpty()) {
+                playlistTracksCache.put(playlist.id, spEmbedTracks)
+                return@withContext spEmbedTracks
+            }
+        }
+
+        if (!cleanExtId.isNullOrBlank() && !playlist.isSpotifyPlaylist && !playlist.isYoutubePlaylist) {
+            val url = "$SAAVN_BASE?__call=playlist.getDetails&api_version=4&_format=json&_marker=0&ctx=web6dot0&listid=$cleanExtId"
             val req = buildSaavnRequest(url)
             runCatching {
                 NetworkModule.fastHttpClient.newCall(req).execute().use { resp ->
@@ -334,11 +421,20 @@ object FullStreamEngine {
             }
         }
 
-        val fallback = searchFullTracks(playlist.seedQuery.ifBlank { playlist.title }, limit = 20, qualityTier = qualityTier)
-        if (fallback.isNotEmpty()) {
-            playlistTracksCache.put(playlist.id, fallback)
+        val candidateQueries = listOf(
+            playlist.seedQuery.trim(),
+            playlist.title.trim(),
+            "${playlist.title.trim()} ${playlist.subtitle.substringBefore("•").trim()}".trim()
+        ).filter { it.length >= 2 }.distinct()
+
+        for (q in candidateQueries) {
+            val fallback = searchFullTracks(q, limit = 20, qualityTier = qualityTier)
+            if (fallback.isNotEmpty()) {
+                playlistTracksCache.put(playlist.id, fallback)
+                return@withContext fallback
+            }
         }
-        fallback
+        emptyList()
     }
 
     /**
@@ -567,6 +663,7 @@ object FullStreamEngine {
                     val uri = item.optString("uri")
                     val spTrackId = uri.substringAfterLast(":").takeIf { it.isNotBlank() } ?: "${entityId}_$i"
                     val durMs = item.optLong("duration", 210_000L).coerceAtLeast(45_000L)
+                    val embedPlayable = if (item.has("isPlayable")) item.optBoolean("isPlayable", true) else true
                     if (tTitle.isBlank()) continue
                     parsedTracks.add(
                         TrackItem(
@@ -580,7 +677,8 @@ object FullStreamEngine {
                             sourceType = AudioSourceType.SPOTIFY,
                             externalSpotifyUri = uri.ifBlank { "spotify:track:$spTrackId" },
                             spotifyTrackId = spTrackId,
-                            streamQualityBadge = "SPOTIFY"
+                            streamQualityBadge = "SPOTIFY",
+                            isPlayable = embedPlayable
                         )
                     )
                 }
@@ -721,26 +819,11 @@ object FullStreamEngine {
             if (safety != null && !safety.url.isNullOrBlank()) return@withContext safety
         }
 
-        // 1. If user selected LOSSLESS_LDAC on primary attempt, probe Lossless 16/24-bit FLAC first
-        if (qualityTier == AudioQualityTier.LOSSLESS_LDAC && effectiveAttempt == 0) {
-            val losslessFlac = runCatching {
-                probeDabStudioCatalogStream(
-                    title = track.title,
-                    artist = track.artist,
-                    album = track.album,
-                    fallbackDurationMs = track.durationMs,
-                    preferLosslessFlac = true
-                )
-            }.getOrNull()
-            if (losslessFlac != null && !losslessFlac.url.isNullOrBlank()) {
-                resolvedStreamCache.put(cacheKey, losslessFlac)
-                return@withContext losslessFlac
-            }
-        }
-
-        // 2. If track carries a direct decrypted studio CDN URL, verify HTTP 200/206 & step down bitrate if needed
+        // 1. If track carries a direct decrypted studio CDN URL (and user didn't force alternate),
+        // verify HTTP 200/206 quickly when not in FLAC-first mode
         val existingUrl = track.audioStreamUrl
         if (effectiveAttempt == 0 &&
+            qualityTier != AudioQualityTier.LOSSLESS_LDAC &&
             !existingUrl.isNullOrBlank() &&
             !existingUrl.contains("mzstatic.com") &&
             !existingUrl.contains("p.scdn.co") &&
@@ -762,10 +845,36 @@ object FullStreamEngine {
 
         val hadDirectSaavnUrl = !existingUrl.isNullOrBlank() && existingUrl.contains("saavncdn.com")
 
-        // 3. Race Official Catalog CDN & Verified YouTube Music Song Catalog concurrently
+        // 2. Race Lossless FLAC, Official Catalog CDN, & Verified YouTube Music concurrently (zero sequential bottleneck!)
         val resolved: ResolvedStreamResult = coroutineScope {
+            val dabStudioJob = async {
+                if (effectiveAttempt <= 1) {
+                    withTimeoutOrNull(2_400L) {
+                        runCatching {
+                            probeDabStudioCatalogStream(
+                                title = track.title,
+                                artist = track.artist,
+                                album = track.album,
+                                fallbackDurationMs = track.durationMs,
+                                preferLosslessFlac = true
+                            )
+                        }.getOrNull()
+                    }
+                } else null
+            }
             val saavnJob = async {
-                if (effectiveAttempt >= 1 && hadDirectSaavnUrl) {
+                if (effectiveAttempt == 0 && hadDirectSaavnUrl && !existingUrl.isNullOrBlank()) {
+                    resolveVerifiedSaavnStream(existingUrl, track.durationMs, qualityTier)
+                        ?: runCatching {
+                            matchBestSaavnStream(
+                                title = track.title,
+                                artist = track.artist,
+                                album = track.album,
+                                targetDurationMs = track.durationMs,
+                                qualityTier = qualityTier
+                            )
+                        }.getOrNull()
+                } else if (effectiveAttempt >= 1 && hadDirectSaavnUrl) {
                     null
                 } else {
                     runCatching {
@@ -778,19 +887,6 @@ object FullStreamEngine {
                         )
                     }.getOrNull()
                 }
-            }
-            val dabStudioJob = async {
-                if (qualityTier != AudioQualityTier.LOSSLESS_LDAC || effectiveAttempt >= 1) {
-                    runCatching {
-                        probeDabStudioCatalogStream(
-                            title = track.title,
-                            artist = track.artist,
-                            album = track.album,
-                            fallbackDurationMs = track.durationMs,
-                            preferLosslessFlac = true
-                        )
-                    }.getOrNull()
-                } else null
             }
             val innerTubeJob = async {
                 runCatching {
@@ -818,10 +914,16 @@ object FullStreamEngine {
             val preferYtmFirst = (effectiveAttempt >= 1 && hadDirectSaavnUrl) ||
                 (qualityTier == AudioQualityTier.YTM_NORMAL && !track.youtubeVideoId.isNullOrBlank() && effectiveAttempt == 0)
 
-            val primary = if (preferYtmFirst) {
-                innerTubeJob.await() ?: saavnJob.await() ?: dabStudioJob.await()
-            } else {
-                saavnJob.await() ?: innerTubeJob.await() ?: dabStudioJob.await()
+            val primary = when {
+                qualityTier == AudioQualityTier.LOSSLESS_LDAC && effectiveAttempt == 0 -> {
+                    dabStudioJob.await() ?: saavnJob.await() ?: innerTubeJob.await()
+                }
+                preferYtmFirst -> {
+                    innerTubeJob.await() ?: saavnJob.await() ?: dabStudioJob.await()
+                }
+                else -> {
+                    saavnJob.await() ?: innerTubeJob.await() ?: dabStudioJob.await()
+                }
             }
 
             primary ?: run {
@@ -917,62 +1019,11 @@ object FullStreamEngine {
         }.getOrNull()
         if (relaxedInnerTube != null && !relaxedInnerTube.url.isNullOrBlank()) return@withContext relaxedInnerTube
 
-        // Tier C: Deezer Global CDN direct MP3 stream
-        val deezerStream = runCatching {
-            val encoded = URLEncoder.encode(query, "UTF-8")
-            val req = Request.Builder()
-                .url("https://api.deezer.com/search?q=$encoded&limit=5")
-                .build()
-            NetworkModule.fastHttpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
-                val data = JSONObject(resp.body?.string().orEmpty()).optJSONArray("data") ?: return@use null
-                for (i in 0 until data.length()) {
-                    val item = data.optJSONObject(i) ?: continue
-                    val preview = item.optString("preview")
-                    if (preview.startsWith("http")) {
-                        return@use ResolvedStreamResult(
-                            url = preview,
-                            durationMs = 30_000L,
-                            codecLabel = "MP3",
-                            containerLabel = "MPEG",
-                            bitrateKbps = 128,
-                            sampleRateHz = 44_100,
-                            bitDepth = 16
-                        )
-                    }
-                }
-                null
-            }
+        // Tier C: SoundCloud full-length progressive stream (verified HTTP 200/206; rejects 30s snipped previews)
+        val scFallback = runCatching {
+            resolveViaSoundCloudProgressive(track)?.takeIf { verifyStreamReachable(it.url, it.requestHeaders) }
         }.getOrNull()
-        if (deezerStream != null && !deezerStream.url.isNullOrBlank()) return@withContext deezerStream
-
-        // Tier D: Apple iTunes Global CDN AAC-LC M4A stream
-        runCatching {
-            val encoded = URLEncoder.encode(query, "UTF-8")
-            val req = Request.Builder()
-                .url("https://itunes.apple.com/search?term=$encoded&entity=song&limit=5")
-                .build()
-            NetworkModule.fastHttpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
-                val results = JSONObject(resp.body?.string().orEmpty()).optJSONArray("results") ?: return@use null
-                for (i in 0 until results.length()) {
-                    val item = results.optJSONObject(i) ?: continue
-                    val previewUrl = item.optString("previewUrl")
-                    if (previewUrl.startsWith("http")) {
-                        return@use ResolvedStreamResult(
-                            url = previewUrl,
-                            durationMs = 30_000L,
-                            codecLabel = "AAC-LC",
-                            containerLabel = "M4A",
-                            bitrateKbps = 256,
-                            sampleRateHz = 44_100,
-                            bitDepth = 16
-                        )
-                    }
-                }
-                null
-            }
-        }.getOrNull()
+        scFallback
     }
 
     // =========================================================================
@@ -1244,14 +1295,16 @@ object FullStreamEngine {
         return items
     }
 
+    // Upstream public CDN stream URLs are obfuscated with fixed DES/ECB; never used for user data.
+    @SuppressLint("GetInstance")
     internal fun decryptSaavnMediaUrl(encryptedBase64: String, prefer320: Boolean): String? {
         if (encryptedBase64.isBlank()) return null
         return try {
             val clean = encryptedBase64.trim()
             val cipherBytes = try {
-                android.util.Base64.decode(clean, android.util.Base64.DEFAULT)
+                Base64.decode(clean, Base64.DEFAULT)
             } catch (_: Throwable) {
-                java.util.Base64.getDecoder().decode(clean)
+                Base64.decode(clean, Base64.URL_SAFE or Base64.NO_WRAP)
             }
             if (cipherBytes == null || cipherBytes.isEmpty()) return null
 
@@ -1782,9 +1835,19 @@ object FullStreamEngine {
                     .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
                     .build()
 
+                var stopTryingClients = false
                 NetworkModule.fastHttpClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use
                     val root = JSONObject(resp.body?.string().orEmpty())
+                    val playability = root.optJSONObject("playabilityStatus")
+                    val statusStr = playability?.optString("status").orEmpty()
+                    val reasonStr = playability?.optString("reason").orEmpty().lowercase()
+                    if (statusStr == "ERROR" ||
+                        (statusStr == "UNPLAYABLE" && (reasonStr.contains("unavailable") || reasonStr.contains("removed") || reasonStr.contains("blocked")))
+                    ) {
+                        stopTryingClients = true
+                        return@use
+                    }
                     val streamingData = root.optJSONObject("streamingData") ?: return@use
                     val adaptive = streamingData.optJSONArray("adaptiveFormats") ?: return@use
 
@@ -1855,6 +1918,7 @@ object FullStreamEngine {
                         }
                     }
                 }
+                if (stopTryingClients) break
             } catch (_: Exception) {
             }
         }

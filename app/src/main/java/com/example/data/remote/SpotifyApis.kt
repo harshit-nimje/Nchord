@@ -1,6 +1,7 @@
 package com.example.data.remote
 
 import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
 import retrofit2.Response
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
@@ -11,6 +12,7 @@ import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 
+@JsonClass(generateAdapter = true)
 data class SpotifyTokenResponseDto(
     @Json(name = "access_token") val accessToken: String,
     @Json(name = "token_type") val tokenType: String,
@@ -39,16 +41,19 @@ interface SpotifyAccountsApi {
     ): SpotifyTokenResponseDto
 }
 
+@JsonClass(generateAdapter = true)
 data class SpotifyImageDto(
     @Json(name = "url") val url: String? = null,
     @Json(name = "height") val height: Int? = null,
     @Json(name = "width") val width: Int? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyFollowersDto(
     @Json(name = "total") val total: Int = 0
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyUserDto(
     @Json(name = "id") val id: String = "",
     @Json(name = "display_name") val displayName: String? = null,
@@ -58,17 +63,20 @@ data class SpotifyUserDto(
     @Json(name = "followers") val followers: SpotifyFollowersDto? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyArtistSimpleDto(
     @Json(name = "id") val id: String? = null,
     @Json(name = "name") val name: String = "Unknown Artist"
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyAlbumSimpleDto(
     @Json(name = "id") val id: String? = null,
     @Json(name = "name") val name: String = "",
     @Json(name = "images") val images: List<SpotifyImageDto>? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyTrackDto(
     @Json(name = "id") val id: String? = null,
     @Json(name = "name") val name: String? = null,
@@ -79,14 +87,17 @@ data class SpotifyTrackDto(
     @Json(name = "album") val album: SpotifyAlbumSimpleDto? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPlaylistTracksMetaDto(
     @Json(name = "total") val total: Int = 0
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPlaylistOwnerDto(
     @Json(name = "display_name") val displayName: String? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPlaylistDto(
     @Json(name = "id") val id: String = "",
     @Json(name = "name") val name: String = "",
@@ -96,32 +107,39 @@ data class SpotifyPlaylistDto(
     @Json(name = "owner") val owner: SpotifyPlaylistOwnerDto? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPagingPlaylistsDto(
     @Json(name = "items") val items: List<SpotifyPlaylistDto> = emptyList()
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifySavedTrackWrapperDto(
     @Json(name = "track") val track: SpotifyTrackDto? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPagingSavedTracksDto(
     @Json(name = "items") val items: List<SpotifySavedTrackWrapperDto> = emptyList()
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPagingTracksDto(
     @Json(name = "items") val items: List<SpotifyTrackDto> = emptyList()
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifySearchTracksResponseDto(
     @Json(name = "tracks") val tracks: SpotifyPagingTracksDto? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyDeviceDto(
     @Json(name = "name") val name: String? = null,
     @Json(name = "type") val type: String? = null,
     @Json(name = "is_active") val isActive: Boolean? = null
 )
 
+@JsonClass(generateAdapter = true)
 data class SpotifyPlaybackStateDto(
     @Json(name = "is_playing") val isPlaying: Boolean? = null,
     @Json(name = "device") val device: SpotifyDeviceDto? = null,

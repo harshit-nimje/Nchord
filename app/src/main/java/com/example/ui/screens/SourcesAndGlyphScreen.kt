@@ -58,20 +58,27 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.example.R
 import com.example.data.model.AudioQualityTier
+import com.example.data.model.DisplayRefreshPolicy
 import com.example.data.model.GlyphSettings
 import com.example.data.model.ScrobblerConfigAndState
 import com.example.data.model.SpotifyPlaylistSummary
@@ -79,6 +86,8 @@ import com.example.data.remote.NetworkModule
 import com.example.ui.NothingUiState
 import com.example.ui.components.FrostedGlassCapsule
 import com.example.ui.components.ImportPlaylistUrlDialog
+import com.example.ui.components.LocalPeakDisplayRefreshHz
+import com.example.ui.theme.MonoFontFamily
 
 @Composable
 @Suppress("UNUSED_PARAMETER")
@@ -110,6 +119,10 @@ fun SourcesAndGlyphScreen(
     onToggleOled: (Boolean) -> Unit,
     onToggleGlyphReactive: (Boolean) -> Unit,
     onToggleAutomix: (Boolean) -> Unit,
+    onToggleHideUnplayable: (Boolean) -> Unit = {},
+    onSelectDisplayRefreshPolicy: (DisplayRefreshPolicy) -> Unit = {},
+    isRealtimeFftActive: Boolean = false,
+    onVisualizerPermissionResult: (Boolean) -> Unit = {},
     onToggleHaptics: (Boolean) -> Unit,
     onReopenOnboarding: () -> Unit,
     onBack: (() -> Unit)? = null,
@@ -117,6 +130,22 @@ fun SourcesAndGlyphScreen(
 ) {
     if (onBack != null) {
         BackHandler(onBack = onBack)
+    }
+
+    val context = LocalContext.current
+    var hasAudioVisualizerPerm by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val visualizerPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasAudioVisualizerPerm = granted
+        onVisualizerPermissionResult(granted)
     }
 
     var clientIdInput by remember(settings.userSpotifyClientId) {
@@ -812,6 +841,79 @@ fun SourcesAndGlyphScreen(
                     )
                 }
 
+                // Display Refresh Rate Policy Segmented Pill (Auto / High 144Hz / Battery Saver)
+                val peakHz = LocalPeakDisplayRefreshHz.current
+                val refreshBadgeText = when (settings.displayRefreshPolicy) {
+                    DisplayRefreshPolicy.HIGH -> "LOCKED ${peakHz}Hz"
+                    DisplayRefreshPolicy.BATTERY_SAVER -> "60Hz CAP"
+                    DisplayRefreshPolicy.AUTO -> "LTPO ${peakHz}Hz"
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Display Refresh Rate",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(
+                                    if (settings.displayRefreshPolicy == DisplayRefreshPolicy.HIGH) {
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                                    } else {
+                                        MaterialTheme.colorScheme.onBackground.copy(alpha = 0.08f)
+                                    }
+                                )
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                                .testTag("display_refresh_active_badge")
+                        ) {
+                            Text(
+                                text = refreshBadgeText,
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                                color = if (settings.displayRefreshPolicy == DisplayRefreshPolicy.HIGH) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+                    }
+                    Text(
+                        text = settings.displayRefreshPolicy.summary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.onBackground.copy(alpha = 0.06f))
+                            .padding(4.dp)
+                            .testTag("display_refresh_policy_group"),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        DisplayRefreshPolicy.entries.forEach { policy ->
+                            val segLabel = if (policy == DisplayRefreshPolicy.HIGH && peakHz >= 90) {
+                                "High • ${peakHz}Hz"
+                            } else {
+                                policy.label
+                            }
+                            PolaritySegment(
+                                label = segLabel,
+                                selected = settings.displayRefreshPolicy == policy,
+                                onClick = { onSelectDisplayRefreshPolicy(policy) },
+                                tag = "refresh_policy_${policy.id}",
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
 
                 CleanPreferenceRow(
@@ -822,12 +924,83 @@ fun SourcesAndGlyphScreen(
                     tag = "switch_glyph_reactive"
                 )
 
+                if (settings.glyphReactiveLeds) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .minimumInteractiveComponentSize()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(MaterialTheme.colorScheme.onBackground.copy(alpha = 0.05f))
+                            .clickable(enabled = !hasAudioVisualizerPerm) {
+                                visualizerPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .testTag("visualizer_fft_mode_row"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                text = when {
+                                    isRealtimeFftActive -> "6-Band Hardware FFT • Live"
+                                    hasAudioVisualizerPerm -> "6-Band Hardware FFT • Armed"
+                                    else -> "Procedural Groove Fallback"
+                                },
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onBackground
+                            )
+                            Text(
+                                text = when {
+                                    isRealtimeFftActive ->
+                                        "Capturing live Sub-bass, Bass, Low-mid, Mid, Upper-mid & Treble output"
+                                    hasAudioVisualizerPerm ->
+                                        "Live session FFT attaches automatically during active audio playback"
+                                    else ->
+                                        "Tap to allow audio-session capture for real 6-band FFT waves (optional)"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(
+                                    if (hasAudioVisualizerPerm) {
+                                        MaterialTheme.colorScheme.onBackground.copy(alpha = 0.12f)
+                                    } else {
+                                        MaterialTheme.colorScheme.primary
+                                    }
+                                )
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = if (hasAudioVisualizerPerm) "READY" else "ENABLE FFT",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (hasAudioVisualizerPerm) {
+                                    MaterialTheme.colorScheme.onBackground
+                                } else {
+                                    MaterialTheme.colorScheme.onPrimary
+                                }
+                            )
+                        }
+                    }
+                }
+
                 CleanPreferenceRow(
                     title = "Automix Queue",
                     subtitle = "Continue playing related songs seamlessly when queue finishes",
                     checked = settings.automixEnabled,
                     onCheckedChange = onToggleAutomix,
                     tag = "switch_automix"
+                )
+
+                CleanPreferenceRow(
+                    title = "Hide Unplayable Songs",
+                    subtitle = "Hide unavailable songs from lists instead of dimming their tiles",
+                    checked = settings.hideUnplayableSongs,
+                    onCheckedChange = onToggleHideUnplayable,
+                    tag = "switch_hide_unplayable"
                 )
 
                 CleanPreferenceRow(

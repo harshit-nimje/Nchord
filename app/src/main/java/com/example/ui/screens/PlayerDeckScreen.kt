@@ -4,12 +4,12 @@ import android.graphics.drawable.BitmapDrawable
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,12 +19,12 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -84,8 +85,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
@@ -94,6 +98,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
@@ -111,9 +117,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.imageLoader
 import coil.request.ImageRequest
+import coil.size.Precision
 import com.example.R
 import com.example.data.model.LyricLine
 import com.example.data.model.RepeatModeState
@@ -123,9 +131,11 @@ import com.example.ui.NothingUiState
 import com.example.ui.components.FrostedGlassCapsule
 import com.example.ui.components.GlyphVinylTurntable
 import com.example.ui.components.LocalGlassBackdrop
+import com.example.ui.components.LocalLowPowerAnimationMode
 import com.example.ui.components.NdotCircularTimecode
 import com.example.ui.components.NothingDotScrubber
 import com.example.ui.components.NothingParticleMatrixBackdrop
+import com.example.ui.components.NothingSlowMarqueeText
 import com.example.ui.components.NothingTrackRow
 import com.example.ui.components.formatTimeCode
 import com.example.ui.components.recordGlassBackdrop
@@ -136,6 +146,8 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -155,6 +167,8 @@ fun NothingMiniPlayerPill(
     isSaved: Boolean = false,
     previousTrack: TrackItem? = null,
     nextTrack: TrackItem? = null,
+    progressOverride: Float? = null,
+    progressFlow: StateFlow<Float>? = null,
     onToggleSave: (() -> Unit)? = null,
     onExpand: () -> Unit,
     onTogglePlay: () -> Unit,
@@ -177,21 +191,23 @@ fun NothingMiniPlayerPill(
         label = "mini_pill_scale"
     )
 
-    val progress = if (audioState.durationMs > 0L) {
+    val fallbackProgress = progressOverride ?: if (audioState.durationMs > 0L) {
         (audioState.currentPositionMs.toFloat() / audioState.durationMs.toFloat()).coerceIn(0f, 1f)
     } else 0f
 
     var pillWidthPx by remember { mutableFloatStateOf(1f) }
     var textViewportWidthPx by remember { mutableFloatStateOf(1f) }
-    val dragOffsetX = remember { Animatable(0f) }
+    var dragOffsetXPx by remember { mutableFloatStateOf(0f) }
+    var settleJob by remember { mutableStateOf<Job?>(null) }
     var crossedMidDetent by remember { mutableStateOf(false) }
 
     LaunchedEffect(track.id) {
         crossedMidDetent = false
-        dragOffsetX.snapTo(0f)
+        settleJob?.cancel()
+        dragOffsetXPx = 0f
     }
 
-    val swipeFrac = (dragOffsetX.value / (pillWidthPx * 0.58f).coerceAtLeast(1f)).coerceIn(-1f, 1f)
+    val swipeFrac = (dragOffsetXPx / (pillWidthPx * 0.58f).coerceAtLeast(1f)).coerceIn(-1f, 1f)
     val absSwipe = abs(swipeFrac)
 
     // Cover art switches to incoming track past ~46% swipe progress
@@ -205,8 +221,9 @@ fun NothingMiniPlayerPill(
     val displayedArtReq = remember(displayedArtTrack.artworkUrl) {
         ImageRequest.Builder(context)
             .data(displayedArtTrack.artworkUrl)
-            .crossfade(140)
             .size(144)
+            .precision(Precision.INEXACT)
+            .allowHardware(true)
             .build()
     }
 
@@ -227,16 +244,20 @@ fun NothingMiniPlayerPill(
             .onSizeChanged { sz ->
                 if (sz.width > 0) pillWidthPx = sz.width.toFloat()
             }
-            .scale(pillScale)
+            .graphicsLayer {
+                scaleX = pillScale
+                scaleY = pillScale
+            }
             .pointerInput(track.id, previousTrack?.id, nextTrack?.id) {
                 detectHorizontalDragGestures(
                     onDragStart = {
+                        settleJob?.cancel()
                         crossedMidDetent = false
                     },
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
                         val maxDrag = pillWidthPx * 0.64f
-                        val nextVal = (dragOffsetX.value + dragAmount).coerceIn(-maxDrag, maxDrag)
+                        val nextVal = (dragOffsetXPx + dragAmount).coerceIn(-maxDrag, maxDrag)
                         val nextFrac = abs(nextVal / (pillWidthPx * 0.58f).coerceAtLeast(1f))
                         if (!crossedMidDetent && nextFrac >= 0.46f) {
                             crossedMidDetent = true
@@ -244,48 +265,55 @@ fun NothingMiniPlayerPill(
                         } else if (crossedMidDetent && nextFrac < 0.42f) {
                             crossedMidDetent = false
                         }
-                        coroutineScope.launch {
-                            dragOffsetX.snapTo(nextVal)
-                        }
+                        dragOffsetXPx = nextVal
                     },
                     onDragEnd = {
-                        val finalFrac = (dragOffsetX.value / (pillWidthPx * 0.58f).coerceAtLeast(1f))
-                        coroutineScope.launch {
+                        val finalFrac = (dragOffsetXPx / (pillWidthPx * 0.58f).coerceAtLeast(1f))
+                        settleJob?.cancel()
+                        settleJob = coroutineScope.launch {
                             when {
                                 finalFrac <= -0.35f -> {
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    dragOffsetX.animateTo(
+                                    animate(
+                                        initialValue = dragOffsetXPx,
                                         targetValue = -pillWidthPx * 0.58f,
                                         animationSpec = tween(durationMillis = 120)
-                                    )
+                                    ) { value, _ -> dragOffsetXPx = value }
                                     latestSkipNext()
-                                    dragOffsetX.snapTo(0f)
+                                    dragOffsetXPx = 0f
                                 }
                                 finalFrac >= 0.35f -> {
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    dragOffsetX.animateTo(
+                                    animate(
+                                        initialValue = dragOffsetXPx,
                                         targetValue = pillWidthPx * 0.58f,
                                         animationSpec = tween(durationMillis = 120)
-                                    )
+                                    ) { value, _ -> dragOffsetXPx = value }
                                     latestSkipPrev?.invoke()
-                                    dragOffsetX.snapTo(0f)
+                                    dragOffsetXPx = 0f
                                 }
                                 else -> {
-                                    dragOffsetX.animateTo(
+                                    animate(
+                                        initialValue = dragOffsetXPx,
                                         targetValue = 0f,
                                         animationSpec = spring(
                                             dampingRatio = Spring.DampingRatioNoBouncy,
                                             stiffness = Spring.StiffnessMedium
                                         )
-                                    )
+                                    ) { value, _ -> dragOffsetXPx = value }
                                 }
                             }
                         }
                     },
                     onDragCancel = {
                         crossedMidDetent = false
-                        coroutineScope.launch {
-                            dragOffsetX.animateTo(0f, spring(stiffness = Spring.StiffnessMedium))
+                        settleJob?.cancel()
+                        settleJob = coroutineScope.launch {
+                            animate(
+                                initialValue = dragOffsetXPx,
+                                targetValue = 0f,
+                                animationSpec = spring(stiffness = Spring.StiffnessMedium)
+                            ) { value, _ -> dragOffsetXPx = value }
                         }
                     }
                 )
@@ -366,23 +394,19 @@ fun NothingMiniPlayerPill(
                                 alpha = (1f - absSwipe * 1.15f).coerceIn(0f, 1f)
                             }
                     ) {
-                        Text(
+                        NothingSlowMarqueeText(
                             text = track.title,
                             style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            color = MaterialTheme.colorScheme.onSurface
                         )
-                        Text(
+                        NothingSlowMarqueeText(
                             text = if (audioState.isBuffering) {
                                 "Resolving ${audioState.streamTelemetry.tier.shortBadge}…"
                             } else {
                                 track.artist
                             },
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
 
@@ -429,7 +453,11 @@ fun NothingMiniPlayerPill(
                         Icon(
                             imageVector = if (isSaved) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                             contentDescription = "Like",
-                            tint = if (isSaved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            tint = if (isSaved) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f)
+                            }
                         )
                     }
                 }
@@ -464,22 +492,47 @@ fun NothingMiniPlayerPill(
                     Icon(
                         imageVector = Icons.Filled.SkipNext,
                         contentDescription = stringResource(R.string.cd_next_track),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.90f)
                     )
                 }
             }
 
-            LinearProgressIndicator(
-                progress = { progress },
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
-                trackColor = Color.Transparent,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 26.dp)
-                    .height(1.5.dp)
+            MiniPlayerProgressLine(
+                progressFlow = progressFlow,
+                fallbackProgress = fallbackProgress,
+                barColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
             )
         }
     }
+}
+
+@Composable
+private fun MiniPlayerProgressLine(
+    progressFlow: StateFlow<Float>?,
+    fallbackProgress: Float,
+    barColor: Color
+) {
+    val progress = if (progressFlow != null) {
+        val live by progressFlow.collectAsStateWithLifecycle()
+        live
+    } else {
+        fallbackProgress
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 26.dp)
+            .height(1.5.dp)
+            .drawBehind {
+                val clamped = progress.coerceIn(0f, 1f)
+                if (clamped > 0f) {
+                    drawRect(
+                        color = barColor,
+                        size = Size(width = size.width * clamped, height = size.height)
+                    )
+                }
+            }
+    )
 }
 
 /**
@@ -497,12 +550,16 @@ fun NothingMiniPlayerPill(
 fun FullScreenNothingPlayer(
     uiState: NothingUiState,
     audioState: AudioEngineState,
+    liveAudioStateFlow: StateFlow<AudioEngineState>? = null,
     isSaved: Boolean,
     savedIds: Set<String>,
     downloadedTrackIds: Set<String> = emptySet(),
     downloadProgress: Map<String, Float> = emptyMap(),
+    unplayableTrackIds: Set<String> = emptySet(),
+    hideUnplayableSongs: Boolean = false,
     glyphReactive: Boolean,
     onCollapse: () -> Unit,
+    onSwipeDismiss: (() -> Unit)? = null,
     onTogglePlay: () -> Unit,
     onSkipPrev: () -> Unit,
     onSkipNext: () -> Unit,
@@ -527,24 +584,29 @@ fun FullScreenNothingPlayer(
     val haptic = LocalHapticFeedback.current
     val coroutineScope = rememberCoroutineScope()
     val latestCollapse by rememberUpdatedState(onCollapse)
+    val latestSwipeDismiss by rememberUpdatedState(onSwipeDismiss)
 
     val bgColor = MaterialTheme.colorScheme.background
     // Page 0 = Up Next (swipe right), Page 1 = Artwork (center default), Page 2 = Lyrics (swipe left)
     val pagerState = rememberPagerState(initialPage = 1, pageCount = { 3 })
 
-    var scrubPreviewFraction by remember { mutableStateOf<Float?>(null) }
     var showAudioStatsHud by remember { mutableStateOf(false) }
 
     // Measure exact Y coordinate of the song title row so dots at/below it never animate
     var backdropRootY by remember { mutableFloatStateOf(0f) }
     var songTitleTopRelativeYPx by remember { mutableFloatStateOf(Float.MAX_VALUE) }
+    var playerContainerHeightPx by remember { mutableFloatStateOf(2200f) }
+    var isSwipeClosing by remember { mutableStateOf(false) }
 
-    // Interactive pull-down / swipe-down to collapse
-    val pullDownOffsetY = remember { Animatable(0f) }
-    val collapseThresholdPx = with(density) { 132.dp.toPx() }
-    val pullProgress = (pullDownOffsetY.value / (collapseThresholdPx * 2.4f).coerceAtLeast(1f)).coerceIn(0f, 1f)
+    // Effortless, zero-recomposition pull-down / flick-down to collapse (read only in drawBehind & graphicsLayer!)
+    var pullDownOffsetYPx by remember { mutableFloatStateOf(0f) }
+    var pullSettleJob by remember { mutableStateOf<Job?>(null) }
+    val collapseThresholdPx = with(density) { 44.dp.toPx() }
+    val flingVelocityThresholdPx = with(density) { 430.dp.toPx() }
+    val minFlingDistancePx = with(density) { 10.dp.toPx() }
+    val pullSheetRoundedShape = remember { RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp) }
 
-    // Extract vibrant album accent color off-main-thread for serene dot waves
+    // Extract vibrant album accent color off-main-thread for dot waves
     var extractedAccent by remember { mutableStateOf(Color(0xFFD71921)) }
     LaunchedEffect(track.artworkUrl) {
         if (track.artworkUrl.isBlank()) {
@@ -572,81 +634,74 @@ fun FullScreenNothingPlayer(
         label = "play_btn_scale"
     )
 
-    // 120Hz frame-interpolated playback clock phase-locked to MediaPlayer position
-    var livePositionMs by remember(track.id) { mutableLongStateOf(audioState.currentPositionMs) }
-    val latestAnchorPos by rememberUpdatedState(audioState.currentPositionMs)
-    val latestDuration by rememberUpdatedState(audioState.durationMs)
-    val latestSpeed by rememberUpdatedState(audioState.playbackSpeed)
-    val latestIsBuffering by rememberUpdatedState(audioState.isBuffering)
-
-    LaunchedEffect(audioState.currentPositionMs, audioState.isPlaying) {
-        if (!audioState.isPlaying || abs(livePositionMs - audioState.currentPositionMs) > 140L) {
-            livePositionMs = audioState.currentPositionMs
-        }
-    }
-
-    LaunchedEffect(audioState.isPlaying, track.id) {
-        if (!audioState.isPlaying) {
-            livePositionMs = latestAnchorPos
-            return@LaunchedEffect
-        }
-        var lastNanos = withFrameNanos { it }
-        while (true) {
-            val nowNanos = withFrameNanos { it }
-            val elapsedMs = (((nowNanos - lastNanos) / 1_000_000.0) * latestSpeed)
-                .toLong()
-                .coerceIn(0L, 48L)
-            lastNanos = nowNanos
-            if (!latestIsBuffering) {
-                val maxDur = latestDuration.coerceAtLeast(1L)
-                val stepped = (livePositionMs + elapsedMs).coerceAtMost(maxDur)
-                val drift = latestAnchorPos - stepped
-                livePositionMs = when {
-                    abs(drift) > 180L -> latestAnchorPos
-                    drift > 28L -> (stepped + 2L).coerceAtMost(maxDur)
-                    drift < -95L -> (stepped - 1L).coerceAtLeast(0L)
-                    else -> stepped
-                }
-            }
-        }
-    }
-
     val playerBackdropRig = rememberGlassBackdropRig(blurRadius = 46.dp)
-    val livePlayerTick = if (audioState.isPlaying) {
-        (livePositionMs / 90L).toInt()
-    } else {
-        pagerState.currentPage
-    }
 
     val onVerticalPullGesture: Modifier = Modifier.pointerInput(Unit) {
+        val velocityTracker = VelocityTracker()
         detectVerticalDragGestures(
+            onDragStart = {
+                pullSettleJob?.cancel()
+                velocityTracker.resetTracking()
+            },
             onVerticalDrag = { change, dragAmount ->
-                if (dragAmount > 0f || pullDownOffsetY.value > 0f) {
+                if (isSwipeClosing) return@detectVerticalDragGestures
+                velocityTracker.addPointerInputChange(change)
+                if (dragAmount > 0f || pullDownOffsetYPx > 0f) {
                     change.consume()
-                    val nextY = (pullDownOffsetY.value + dragAmount).coerceAtLeast(0f)
-                    coroutineScope.launch { pullDownOffsetY.snapTo(nextY) }
+                    val gain = if (dragAmount > 0f) 1.18f else 1.0f
+                    pullDownOffsetYPx = (pullDownOffsetYPx + dragAmount * gain).coerceAtLeast(0f)
                 }
             },
             onDragEnd = {
-                if (pullDownOffsetY.value >= collapseThresholdPx) {
+                if (isSwipeClosing) return@detectVerticalDragGestures
+                val vy = velocityTracker.calculateVelocity().y
+                val shouldCollapse = pullDownOffsetYPx >= collapseThresholdPx ||
+                    (pullDownOffsetYPx >= minFlingDistancePx && vy >= flingVelocityThresholdPx)
+                if (shouldCollapse) {
+                    isSwipeClosing = true
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    latestCollapse()
-                    coroutineScope.launch { pullDownOffsetY.snapTo(0f) }
+                    pullSettleJob?.cancel()
+                    pullSettleJob = coroutineScope.launch {
+                        // Smoothly continue sliding down from exact finger position — zero snap-back jump!
+                        animate(
+                            initialValue = pullDownOffsetYPx,
+                            targetValue = playerContainerHeightPx,
+                            animationSpec = tween(
+                                durationMillis = 165,
+                                easing = FastOutLinearInEasing
+                            )
+                        ) { value, _ -> pullDownOffsetYPx = value }
+                        val customDismiss = latestSwipeDismiss
+                        if (customDismiss != null) {
+                            customDismiss()
+                        } else {
+                            latestCollapse()
+                        }
+                    }
                 } else {
-                    coroutineScope.launch {
-                        pullDownOffsetY.animateTo(
+                    pullSettleJob?.cancel()
+                    pullSettleJob = coroutineScope.launch {
+                        animate(
+                            initialValue = pullDownOffsetYPx,
                             targetValue = 0f,
                             animationSpec = spring(
                                 dampingRatio = Spring.DampingRatioNoBouncy,
                                 stiffness = Spring.StiffnessMedium
                             )
-                        )
+                        ) { value, _ -> pullDownOffsetYPx = value }
                     }
                 }
             },
             onDragCancel = {
-                coroutineScope.launch {
-                    pullDownOffsetY.animateTo(0f, spring(stiffness = Spring.StiffnessMedium))
+                if (!isSwipeClosing) {
+                    pullSettleJob?.cancel()
+                    pullSettleJob = coroutineScope.launch {
+                        animate(
+                            initialValue = pullDownOffsetYPx,
+                            targetValue = 0f,
+                            animationSpec = spring(stiffness = Spring.StiffnessMedium)
+                        ) { value, _ -> pullDownOffsetYPx = value }
+                    }
                 }
             }
         )
@@ -654,11 +709,17 @@ fun FullScreenNothingPlayer(
 
     val isArtworkFocused = pagerState.currentPage == 1
 
-    // Outer scrim + touch blocker so touches never leak through to Home tiles
+    // Outer scrim + touch blocker: drawBehind reads pullDownOffsetYPx directly in Draw Phase (0 recompositions!)
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = (1f - pullProgress * 0.65f).coerceIn(0f, 1f)))
+            .onSizeChanged { sz ->
+                if (sz.height > 0) playerContainerHeightPx = sz.height.toFloat()
+            }
+            .drawBehind {
+                val fade = (pullDownOffsetYPx / size.height.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                drawRect(Color.Black.copy(alpha = (1f - fade * 0.92f).coerceIn(0f, 1f)))
+            }
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -670,20 +731,20 @@ fun FullScreenNothingPlayer(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    translationY = pullDownOffsetY.value
-                    val s = 1f - (pullProgress * 0.045f)
+                    val y = pullDownOffsetYPx
+                    translationY = y
+                    val pullProgress = (y / (collapseThresholdPx * 3.2f).coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    val s = 1f - (pullProgress * 0.035f)
                     scaleX = s
                     scaleY = s
+                    if (y > 3f) {
+                        clip = true
+                        shape = pullSheetRoundedShape
+                    }
                 }
-                .clip(
-                    RoundedCornerShape(
-                        topStart = if (pullDownOffsetY.value > 3f) 28.dp else 0.dp,
-                        topEnd = if (pullDownOffsetY.value > 3f) 28.dp else 0.dp
-                    )
-                )
                 .background(bgColor)
         ) {
-            // Recorded backdrop layer: Stationary-Grid Dot-Matrix Wave + Soft Artwork Aura
+            // Recorded backdrop layer: isolated leaf composable collects 22Hz FFT & position without recomposing player UI
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -692,26 +753,22 @@ fun FullScreenNothingPlayer(
                     }
                     .recordGlassBackdrop(playerBackdropRig, bgColor)
             ) {
-                AmbientArtworkAura(
-                    isPlaying = audioState.isPlaying && !audioState.isBuffering,
-                    isLyricsOrQueue = !isArtworkFocused,
-                    spectrum = audioState.glyphSpectrum,
-                    accentColor = smoothAccent,
-                    modifier = Modifier.fillMaxSize()
-                )
-                NothingParticleMatrixBackdrop(
-                    isPlaying = audioState.isPlaying && !audioState.isBuffering && glyphReactive,
-                    visible = isArtworkFocused,
-                    spectrum = if (glyphReactive) audioState.glyphSpectrum else emptyList(),
+                LivePlayerBackdropStage(
+                    fallbackAudioState = audioState,
+                    liveAudioStateFlow = liveAudioStateFlow,
+                    trackId = track.id,
+                    trackTitleHint = "${track.title} ${track.album}",
+                    isArtworkFocused = isArtworkFocused,
+                    glyphReactive = glyphReactive,
                     accentColor = smoothAccent,
                     staticCutoffYPx = songTitleTopRelativeYPx,
-                    modifier = Modifier.fillMaxSize()
+                    onFrameRendered = playerBackdropRig::notifyBackdropMutated
                 )
             }
 
-            // Foreground UI with live heavy backdrop blur wired to frosted capsules
+            // Foreground UI with live quarter-res backdrop blur wired to frosted capsules
             CompositionLocalProvider(
-                LocalGlassBackdrop provides playerBackdropRig.toState(extraTick = livePlayerTick)
+                LocalGlassBackdrop provides playerBackdropRig.toState(extraTick = pagerState.currentPage)
             ) {
                 Column(
                     modifier = Modifier
@@ -835,17 +892,17 @@ fun FullScreenNothingPlayer(
                         }
                     }
 
-                    // Center HorizontalPager Stage: Swipe Right -> Up Next (0) | Artwork (1) | Swipe Left -> Lyrics (2)
-                    BoxWithConstraints(
+                    // Center HorizontalPager Stage (zero BoxWithConstraints SubcomposeLayout overhead!)
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
                             .padding(vertical = 8.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        val stageMax = minOf(maxWidth, maxHeight) * 0.86f
                         HorizontalPager(
                             state = pagerState,
+                            beyondViewportPageCount = 0,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .testTag("player_horizontal_pager")
@@ -892,22 +949,32 @@ fun FullScreenNothingPlayer(
                                                 }
                                             }
                                         }
+                                        val visibleQueue = remember(uiState.queue, unplayableTrackIds, downloadedTrackIds, hideUnplayableSongs) {
+                                            if (!hideUnplayableSongs) uiState.queue
+                                            else uiState.queue.filter { q ->
+                                                (q.isPlayable && q.id !in unplayableTrackIds) || q.id in downloadedTrackIds || q.isDownloaded
+                                            }
+                                        }
                                         LazyColumn(
                                             modifier = Modifier.fillMaxSize(),
                                             contentPadding = PaddingValues(vertical = 8.dp),
                                             verticalArrangement = Arrangement.spacedBy(2.dp)
                                         ) {
                                             itemsIndexed(
-                                                uiState.queue,
-                                                key = { idx, item -> "${idx}_${item.id}" }
+                                                items = visibleQueue,
+                                                key = { idx, item -> "${idx}_${item.id}" },
+                                                contentType = { _, _ -> "queue_track_row" }
                                             ) { _, qTrack ->
+                                                val isDl = qTrack.id in downloadedTrackIds || qTrack.isDownloaded
+                                                val isUnplayable = (!qTrack.isPlayable || qTrack.id in unplayableTrackIds) && !isDl
                                                 NothingTrackRow(
                                                     track = qTrack,
                                                     isCurrentTrack = qTrack.id == track.id,
                                                     isPlaying = audioState.isPlaying && qTrack.id == track.id,
                                                     isSaved = qTrack.id in savedIds,
-                                                    isDownloaded = qTrack.id in downloadedTrackIds || qTrack.isDownloaded,
+                                                    isDownloaded = isDl,
                                                     downloadProgress = downloadProgress[qTrack.id],
+                                                    isUnplayable = isUnplayable,
                                                     onPlayClick = { onPlayQueueItem(qTrack) },
                                                     onToggleSave = { onToggleSave(qTrack) },
                                                     onLongClick = { onOpenTrackOptions(qTrack) }
@@ -918,7 +985,7 @@ fun FullScreenNothingPlayer(
                                 }
 
                                 1 -> {
-                                    // Center Artwork Platter Stage (also supports pull-down to dismiss)
+                                    // Center Artwork Platter Stage (decoupled from 22Hz FFT ticks -> 0 recompositions while spinning at 144Hz)
                                     Box(
                                         modifier = Modifier
                                             .fillMaxSize()
@@ -929,18 +996,22 @@ fun FullScreenNothingPlayer(
                                             artworkUrl = track.artworkUrl,
                                             isPlaying = audioState.isPlaying,
                                             glyphReactive = glyphReactive,
-                                            spectrum = audioState.glyphSpectrum,
-                                            modifier = Modifier.size(stageMax.coerceAtMost(306.dp))
+                                            modifier = Modifier
+                                                .fillMaxSize(0.86f)
+                                                .sizeIn(maxWidth = 306.dp, maxHeight = 306.dp)
+                                                .aspectRatio(1f)
                                         )
                                     }
                                 }
 
                                 else -> {
-                                    // Synced Lyrics Stage (swiped left from Artwork)
-                                    SyncedLyricsStage(
+                                    // Synced Lyrics Stage (swiped left from Artwork) — collects live clock strictly when page == 2
+                                    LiveSyncedLyricsPane(
+                                        fallbackAudioState = audioState,
+                                        liveAudioStateFlow = liveAudioStateFlow,
+                                        active = pagerState.currentPage == 2,
                                         lyrics = uiState.lyrics,
                                         isLoading = uiState.isLyricsLoading,
-                                        currentPosMs = livePositionMs,
                                         lyricsOffsetMs = uiState.lyricsOffsetMs,
                                         accentColor = smoothAccent,
                                         onSeekLine = onSeekMs,
@@ -953,7 +1024,11 @@ fun FullScreenNothingPlayer(
                     }
 
                     // Bottom Metadata + Audio Quality Telemetry + Dramatic Thickening Scrubber + Transport
-                    Column(modifier = Modifier.fillMaxWidth()) {
+                    // Note: Do NOT attach onVerticalPullGesture to the outer Column wrapping the scrubber,
+                    // otherwise fast horizontal scrubbing with slight diagonal thumb drift gets stolen!
+                    Column(
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         AnimatedVisibility(visible = showAudioStatsHud) {
                             FrostedGlassCapsule(
                                 shape = RoundedCornerShape(18.dp),
@@ -1039,24 +1114,21 @@ fun FullScreenNothingPlayer(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                                Text(
+                                NothingSlowMarqueeText(
                                     text = track.title,
                                     style = MaterialTheme.typography.headlineMedium,
                                     color = MaterialTheme.colorScheme.onBackground,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    Text(
+                                    NothingSlowMarqueeText(
                                         text = track.artist,
                                         style = MaterialTheme.typography.bodyLarge,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier
                                             .weight(1f, fill = false)
                                             .clickable { onOpenArtist(track.artist) }
@@ -1167,45 +1239,12 @@ fun FullScreenNothingPlayer(
 
                         Spacer(modifier = Modifier.height(10.dp))
 
-                        val fraction = if (audioState.durationMs > 0L) {
-                            (livePositionMs.toFloat() / audioState.durationMs.toFloat()).coerceIn(0f, 1f)
-                        } else 0f
-
-                        NothingDotScrubber(
-                            progressFraction = fraction,
-                            trackSeed = track.id.hashCode(),
-                            onScrubPreviewFraction = { preview ->
-                                scrubPreviewFraction = preview
-                            },
-                            onSeekFraction = { frac ->
-                                val targetMs = (frac * audioState.durationMs).toLong()
-                                livePositionMs = targetMs
-                                onSeekMs(targetMs)
-                            }
+                        PlayerScrubberAndTimecodeSection(
+                            trackId = track.id,
+                            fallbackAudioState = audioState,
+                            liveAudioStateFlow = liveAudioStateFlow,
+                            onSeekMs = onSeekMs
                         )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        val displayedPositionMs = scrubPreviewFraction?.let {
-                            (it * audioState.durationMs).toLong()
-                        } ?: livePositionMs
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            NdotCircularTimecode(
-                                text = formatTimeCode(displayedPositionMs),
-                                dotColor = MaterialTheme.colorScheme.onBackground,
-                                dotSizeDp = 2.4.dp
-                            )
-                            NdotCircularTimecode(
-                                text = formatTimeCode(audioState.durationMs),
-                                dotColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                dotSizeDp = 2.4.dp
-                            )
-                        }
 
                         Spacer(modifier = Modifier.height(14.dp))
 
@@ -1343,8 +1382,207 @@ fun FullScreenNothingPlayer(
 }
 
 /**
+ * Isolated leaf 120Hz playback clock so only the scrubber/lyrics leaf composables recompose on frame ticks —
+ * preventing full-screen player & glass backdrop re-recordings.
+ */
+@Composable
+private fun rememberLivePlaybackPositionMs(
+    audioState: AudioEngineState,
+    active: Boolean = true
+): Long {
+    val trackId = audioState.currentTrack?.id ?: ""
+    var livePositionMs by remember(trackId) { mutableLongStateOf(audioState.currentPositionMs) }
+    val lowPowerMode = LocalLowPowerAnimationMode.current
+    val latestLowPower by rememberUpdatedState(lowPowerMode)
+    val latestAnchorPos by rememberUpdatedState(audioState.currentPositionMs)
+    val latestDuration by rememberUpdatedState(audioState.durationMs)
+    val latestSpeed by rememberUpdatedState(audioState.playbackSpeed)
+    val latestIsBuffering by rememberUpdatedState(audioState.isBuffering)
+
+    LaunchedEffect(audioState.currentPositionMs, audioState.isPlaying, active) {
+        if (!active || !audioState.isPlaying || abs(livePositionMs - audioState.currentPositionMs) > 140L) {
+            livePositionMs = audioState.currentPositionMs
+        }
+    }
+
+    LaunchedEffect(audioState.isPlaying, trackId, active) {
+        if (!active || !audioState.isPlaying) {
+            livePositionMs = latestAnchorPos
+            return@LaunchedEffect
+        }
+        var lastNanos = withFrameNanos { it }
+        while (true) {
+            val nowNanos = withFrameNanos { it }
+            val rawDeltaNanos = nowNanos - lastNanos
+            if (latestLowPower && rawDeltaNanos in 0L until 48_000_000L) {
+                continue
+            }
+            val elapsedMs = (((rawDeltaNanos) / 1_000_000.0) * latestSpeed)
+                .toLong()
+                .coerceIn(0L, 64L)
+            lastNanos = nowNanos
+            if (!latestIsBuffering) {
+                val maxDur = latestDuration.coerceAtLeast(1L)
+                val stepped = (livePositionMs + elapsedMs).coerceAtMost(maxDur)
+                val drift = latestAnchorPos - stepped
+                livePositionMs = when {
+                    abs(drift) > 180L -> latestAnchorPos
+                    drift > 28L -> (stepped + 2L).coerceAtMost(maxDur)
+                    drift < -95L -> (stepped - 1L).coerceAtLeast(0L)
+                    else -> stepped
+                }
+            }
+        }
+    }
+    return livePositionMs
+}
+
+@Composable
+private fun LivePlayerBackdropStage(
+    fallbackAudioState: AudioEngineState,
+    liveAudioStateFlow: StateFlow<AudioEngineState>?,
+    trackId: String,
+    trackTitleHint: String,
+    isArtworkFocused: Boolean,
+    glyphReactive: Boolean,
+    accentColor: Color,
+    staticCutoffYPx: Float,
+    onFrameRendered: () -> Unit
+) {
+    val activeAudio = if (liveAudioStateFlow != null) {
+        val live by liveAudioStateFlow.collectAsStateWithLifecycle()
+        live
+    } else {
+        fallbackAudioState
+    }
+    AmbientArtworkAura(
+        isPlaying = activeAudio.isPlaying && !activeAudio.isBuffering,
+        isLyricsOrQueue = !isArtworkFocused,
+        spectrum = activeAudio.glyphSpectrum,
+        accentColor = accentColor,
+        modifier = Modifier.fillMaxSize()
+    )
+    NothingParticleMatrixBackdrop(
+        isPlaying = activeAudio.isPlaying && !activeAudio.isBuffering && glyphReactive,
+        visible = isArtworkFocused,
+        spectrum = if (glyphReactive) activeAudio.glyphSpectrum else emptyList(),
+        sixBandSpectrum = if (glyphReactive) activeAudio.sixBandSpectrum else emptyList(),
+        trackSignatureKey = trackId,
+        trackTitleHint = trackTitleHint,
+        playbackPositionMs = activeAudio.currentPositionMs,
+        playbackSpeed = activeAudio.playbackSpeed,
+        accentColor = accentColor,
+        staticCutoffYPx = staticCutoffYPx,
+        onFrameRendered = onFrameRendered,
+        modifier = Modifier.fillMaxSize()
+    )
+}
+
+@Composable
+private fun LiveSyncedLyricsPane(
+    fallbackAudioState: AudioEngineState,
+    liveAudioStateFlow: StateFlow<AudioEngineState>?,
+    active: Boolean,
+    lyrics: List<LyricLine>,
+    isLoading: Boolean,
+    lyricsOffsetMs: Long,
+    accentColor: Color,
+    onSeekLine: (Long) -> Unit,
+    onAdjustOffset: (Long) -> Unit,
+    onResetOffset: () -> Unit
+) {
+    val activeAudio = if (active && liveAudioStateFlow != null) {
+        val live by liveAudioStateFlow.collectAsStateWithLifecycle()
+        live
+    } else {
+        fallbackAudioState
+    }
+    val liveLyricsPosMs = rememberLivePlaybackPositionMs(
+        audioState = activeAudio,
+        active = active
+    )
+    SyncedLyricsStage(
+        lyrics = lyrics,
+        isLoading = isLoading,
+        currentPosMs = liveLyricsPosMs,
+        lyricsOffsetMs = lyricsOffsetMs,
+        accentColor = accentColor,
+        onSeekLine = onSeekLine,
+        onAdjustOffset = onAdjustOffset,
+        onResetOffset = onResetOffset
+    )
+}
+
+@Composable
+private fun PlayerScrubberAndTimecodeSection(
+    trackId: String,
+    fallbackAudioState: AudioEngineState,
+    liveAudioStateFlow: StateFlow<AudioEngineState>?,
+    onSeekMs: (Long) -> Unit
+) {
+    val activeAudio = if (liveAudioStateFlow != null) {
+        val live by liveAudioStateFlow.collectAsStateWithLifecycle()
+        live
+    } else {
+        fallbackAudioState
+    }
+    var scrubPreviewFraction by remember(trackId) { mutableStateOf<Float?>(null) }
+    val livePositionMs = rememberLivePlaybackPositionMs(
+        audioState = activeAudio,
+        active = scrubPreviewFraction == null
+    )
+
+    val durationMs = activeAudio.durationMs
+    val fraction = if (durationMs > 0L) {
+        (livePositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+
+    NothingDotScrubber(
+        progressFraction = fraction,
+        trackSeed = trackId.hashCode(),
+        onScrubPreviewFraction = { preview ->
+            scrubPreviewFraction = preview
+        },
+        onSeekFraction = { frac ->
+            val targetMs = (frac * durationMs).toLong()
+            onSeekMs(targetMs)
+        }
+    )
+
+    Spacer(modifier = Modifier.height(4.dp))
+
+    val displayedPositionMs = scrubPreviewFraction?.let {
+        (it * durationMs).toLong()
+    } ?: livePositionMs
+
+    // Quantize elapsed & duration to whole seconds so NdotCircularTimecode only recomposes 1x/sec instead of 144x/sec!
+    val elapsedWholeSec = (displayedPositionMs.coerceAtLeast(0L)) / 1000L
+    val durationWholeSec = (durationMs.coerceAtLeast(0L)) / 1000L
+    val elapsedLabel = remember(elapsedWholeSec) { formatTimeCode(elapsedWholeSec * 1000L) }
+    val durationLabel = remember(durationWholeSec) { formatTimeCode(durationWholeSec * 1000L) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        NdotCircularTimecode(
+            text = elapsedLabel,
+            dotColor = MaterialTheme.colorScheme.onBackground,
+            dotSizeDp = 2.4.dp
+        )
+        NdotCircularTimecode(
+            text = durationLabel,
+            dotColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            dotSizeDp = 2.4.dp
+        )
+    }
+}
+
+/**
  * Subtle radial artwork atmosphere behind the particle lattice.
- * Dims smoothly when paused or on Lyrics/Queue panes so text contrast stays razor-sharp.
+ * Caches its radial shader in [drawWithCache] (0 per-frame Brush/List allocations) and modulates
+ * bass pulse & stage opacity purely in GPU [graphicsLayer].
  */
 @Composable
 private fun AmbientArtworkAura(
@@ -1355,7 +1593,10 @@ private fun AmbientArtworkAura(
     modifier: Modifier = Modifier
 ) {
     val rawBass = if (isPlaying && spectrum.isNotEmpty()) {
-        spectrum.take(3).average().toFloat()
+        val count = min(3, spectrum.size)
+        var sum = 0f
+        for (i in 0 until count) sum += spectrum[i]
+        sum / count.toFloat()
     } else 0f
     val bassGlow by animateFloatAsState(
         targetValue = rawBass.coerceIn(0f, 1f),
@@ -1377,23 +1618,36 @@ private fun AmbientArtworkAura(
 
     if (auraAlpha <= 0.005f) return
 
-    Canvas(modifier = modifier) {
-        val focalCenter = Offset(size.width * 0.5f, size.height * 0.36f)
-        val radius = minOf(size.width, size.height) * (0.62f + bassGlow * 0.12f)
-        drawCircle(
-            brush = Brush.radialGradient(
-                colors = listOf(
-                    accentColor.copy(alpha = auraAlpha),
-                    accentColor.copy(alpha = auraAlpha * 0.30f),
-                    Color.Transparent
-                ),
-                center = focalCenter,
-                radius = radius.coerceAtLeast(1f)
-            ),
-            radius = radius,
-            center = focalCenter
-        )
-    }
+    Box(
+        modifier = modifier
+            .graphicsLayer {
+                alpha = auraAlpha.coerceIn(0f, 1f)
+                val pulseScale = 1f + (bassGlow * 0.16f)
+                scaleX = pulseScale
+                scaleY = pulseScale
+                transformOrigin = TransformOrigin(0.5f, 0.36f)
+            }
+            .drawWithCache {
+                val focalCenter = Offset(size.width * 0.5f, size.height * 0.36f)
+                val baseRadius = (minOf(size.width, size.height) * 0.64f).coerceAtLeast(1f)
+                val cachedBrush = Brush.radialGradient(
+                    colors = listOf(
+                        accentColor,
+                        accentColor.copy(alpha = 0.30f),
+                        Color.Transparent
+                    ),
+                    center = focalCenter,
+                    radius = baseRadius
+                )
+                onDrawBehind {
+                    drawCircle(
+                        brush = cachedBrush,
+                        radius = baseRadius,
+                        center = focalCenter
+                    )
+                }
+            }
+    )
 }
 
 /**
@@ -1581,7 +1835,8 @@ private fun SyncedLyricsStage(
         ) {
             itemsIndexed(
                 items = lyrics,
-                key = { idx, line -> "${idx}_${line.timestampMs}" }
+                key = { idx, line -> "${idx}_${line.timestampMs}" },
+                contentType = { _, _ -> if (isTimeSynced) "synced_lyric_line" else "plain_lyric_line" }
             ) { idx, line ->
                 if (!isTimeSynced) {
                     Text(

@@ -1,0 +1,232 @@
+name: Build APK & Publish Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build & publish (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+        type: string
+      publish_release:
+        description: "Create or update GitHub Release with signed APKs"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nchord-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Audit, Test, Build APK & Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 36.1 & Build-Tools 36.0.0
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36.1" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Determine release version & publish policy
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_PUBLISH: ${{ inputs.publish_release }}
+        run: |
+          PUBLISH="false"
+          TAG="v1.0.0"
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+            PUBLISH="true"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-v1.0.0}"
+            PUBLISH="${INPUT_PUBLISH:-true}"
+          elif [ "$EVENT_NAME" = "push" ] && { [ "$REF_NAME" = "main" ] || [ "$REF_NAME" = "master" ]; }; then
+            TAG="v1.0.0"
+            # Automatically publish the first version release (v1.0.0) on initial push to main/master
+            if ! gh release view "v1.0.0" >/dev/null 2>&1; then
+              echo "Initial release v1.0.0 not found — scheduling automatic first GitHub Release."
+              PUBLISH="true"
+            else
+              echo "Release v1.0.0 already exists — building CI APK artifacts only."
+              PUBLISH="false"
+            fi
+          fi
+
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish_release=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare .env configuration
+        env:
+          OPT_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
+          OPT_LASTFM_SECRET: ${{ secrets.LASTFM_SHARED_SECRET }}
+        run: |
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+          if [ -n "$OPT_LASTFM_KEY" ]; then
+            sed -i "s|^LASTFM_API_KEY=.*|LASTFM_API_KEY=${OPT_LASTFM_KEY}|" .env
+          fi
+          if [ -n "$OPT_LASTFM_SECRET" ]; then
+            sed -i "s|^LASTFM_SHARED_SECRET=.*|LASTFM_SHARED_SECRET=${OPT_LASTFM_SECRET}|" .env
+          fi
+
+      - name: Configure Debug & Release APK Signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          SECRET_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # 1. Materialize debug.keystore from tracked debug.keystore.base64
+          if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
+            tr -d '[:space:]' < debug.keystore.base64 | base64 -d > debug.keystore
+          fi
+
+          # 2. Configure Release keystore (uses GitHub Secrets if provided, else generates an installable PKCS12 key with alias 'upload')
+          KEYSTORE_FILE="${RUNNER_TEMP}/nchord-release-upload.jks"
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$SECRET_STORE_PASSWORD" ] && [ -n "$SECRET_KEY_PASSWORD" ]; then
+            echo "Using repository RELEASE_KEYSTORE_BASE64 secret for release signing."
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_FILE"
+            echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=$SECRET_STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$SECRET_KEY_PASSWORD" >> "$GITHUB_ENV"
+          else
+            echo "No custom release keystore secrets configured — generating ephemeral self-signed release keystore (alias: upload)."
+            EPHEMERAL_PASS="nchord-release-$(openssl rand -hex 12)"
+            echo "::add-mask::$EPHEMERAL_PASS"
+            keytool -genkeypair \
+              -v \
+              -keystore "$KEYSTORE_FILE" \
+              -storetype PKCS12 \
+              -alias upload \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$EPHEMERAL_PASS" \
+              -keypass "$EPHEMERAL_PASS" \
+              -dname "CN=Nchord, OU=Mobile, O=Nchord, L=London, ST=London, C=GB"
+            echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=$EPHEMERAL_PASS" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$EPHEMERAL_PASS" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run Android Lint & Unit/Robolectric Test Suite
+        run: gradle :app:lintDebug :app:testDebugUnitTest --no-daemon
+
+      - name: Assemble Signed Release & Debug APKs
+        run: gradle :app:assembleRelease :app:assembleDebug --no-daemon
+
+      - name: Stage APKs & Generate SHA-256 Checksums
+        env:
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          mkdir -p dist
+          RELEASE_APK=$(find app/build/outputs/apk/release -maxdepth 2 -name "*.apk" | head -n 1)
+          DEBUG_APK=$(find app/build/outputs/apk/debug -maxdepth 2 -name "*.apk" | head -n 1)
+
+          if [ -z "$RELEASE_APK" ] || [ ! -f "$RELEASE_APK" ]; then
+            echo "Error: Signed Release APK was not generated!"
+            exit 1
+          fi
+          if [ -z "$DEBUG_APK" ] || [ ! -f "$DEBUG_APK" ]; then
+            echo "Error: Debug APK was not generated!"
+            exit 1
+          fi
+
+          cp "$RELEASE_APK" "dist/Nchord-${TAG}-release.apk"
+          cp "$DEBUG_APK" "dist/Nchord-${TAG}-debug.apk"
+
+          (
+            cd dist
+            sha256sum "Nchord-${TAG}-release.apk" "Nchord-${TAG}-debug.apk" > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
+
+      - name: Upload APK Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nchord-${{ steps.meta.outputs.release_tag }}-apks
+          path: |
+            dist/Nchord-*.apk
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release (${{ steps.meta.outputs.release_tag }})
+        if: steps.meta.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          if [ "$TAG" = "v1.0.0" ]; then
+            TITLE="Nchord v1.0.0 — First Release"
+          else
+            TITLE="Nchord ${TAG}"
+          fi
+
+          NOTES_ARGS=()
+          if [ -f RELEASE_NOTES.md ] && [ "$TAG" = "v1.0.0" ]; then
+            NOTES_ARGS=(--notes-file RELEASE_NOTES.md)
+          else
+            NOTES_ARGS=(--generate-notes)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing GitHub Release $TAG with fresh APK assets..."
+            gh release upload "$TAG" \
+              "dist/Nchord-${TAG}-release.apk" \
+              "dist/Nchord-${TAG}-debug.apk" \
+              "dist/SHA256SUMS.txt" \
+              --clobber
+          else
+            echo "Creating GitHub Release $TAG..."
+            gh release create "$TAG" \
+              "dist/Nchord-${TAG}-release.apk" \
+              "dist/Nchord-${TAG}-debug.apk" \
+              "dist/SHA256SUMS.txt" \
+              --target "$TARGET_SHA" \
+              --title "$TITLE" \
+              "${NOTES_ARGS[@]}" \
+              --latest
+          fi

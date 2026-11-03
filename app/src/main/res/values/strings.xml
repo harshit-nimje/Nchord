@@ -4,7 +4,6 @@
     <!-- Minimalist Navigation & Section Titles -->
     <string name="header_home">Nchord</string>
     <string name="header_search">Search</string>
-    <string name="header_insights">Insights</string>
     <string name="header_library">Library</string>
     <string name="header_sources">Studio</string>
     <string name="header_account">Account</string>
@@ -34,15 +33,12 @@
     <string name="sp_disconnect">Disconnect</string>
 
     <!-- Editorial Home & Search Sections -->
-    <string name="section_rotation">Your Rotation</string>
     <string name="section_picked_for_you">Picked for you</string>
     <string name="section_soundtrack">Soundtrack your night</string>
     <string name="section_spotify_crates">Spotify Collector Crates</string>
     <string name="section_ytm_sessions">YouTube Music Sessions</string>
     <string name="section_vinyl_pressings">Essential Vinyl Pressings</string>
     <string name="section_featured">Needle Drops</string>
-    <string name="section_channels">Vibes</string>
-    <string name="section_playlists">Playlists</string>
     <string name="search_placeholder">Songs, playlists, Spotify or YTM URL…</string>
 
     <!-- Library -->
@@ -52,8 +48,6 @@
     <string name="lib_recent">Recent</string>
     <string name="lib_local">Device</string>
     <string name="lib_import">Import</string>
-    <string name="lib_new_playlist">New Playlist</string>
-    <string name="lib_pin_limit">Max 4 items can be pinned</string>
     <string name="lib_delete_playlist_title">Delete Playlist?</string>
     <string name="lib_delete_playlist_desc">This removes the playlist from your Nchord library. Downloaded songs remain untouched.</string>
     <string name="lib_empty_playlists">Create a custom playlist or import from Spotify or YouTube Music.</string>
@@ -62,10 +56,8 @@
     <string name="lib_empty_recent">Songs you listen to appear here automatically.</string>
     <string name="lib_empty_device">Import FLAC, WAV, MP3, or M4A files from your device.</string>
 
-    <!-- Insights & Scrobbler -->
-    <string name="insights_subtitle">SONIC AURA • COLLECTOR TELEMETRY</string>
+    <!-- Scrobbler -->
     <string name="scrobbler_connect">Connect Scrobbler</string>
-    <string name="scrobbler_sync_now">Sync Now</string>
 
     <!-- Player -->
     <string name="player_tab_disc">Artwork</string>
@@ -80,7 +72,6 @@
     <string name="cd_next_track">Next track</string>
     <string name="cd_prev_track">Previous track</string>
     <string name="cd_like_track">Save track</string>
-    <string name="cd_download_track">Download for offline listening</string>
     <string name="cd_pin_item">Pin or unpin item</string>
     <string name="cd_delete_playlist">Delete playlist</string>
     <string name="cd_track_options">Song options</string>

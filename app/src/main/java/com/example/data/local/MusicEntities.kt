@@ -1,9 +1,15 @@
 package com.example.data.local
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "saved_tracks")
+@Entity(
+    tableName = "saved_tracks",
+    indices = [
+        Index(value = ["savedAt"])
+    ]
+)
 data class SavedTrackEntity(
     @PrimaryKey val id: String,
     val title: String,
@@ -21,7 +27,14 @@ data class SavedTrackEntity(
     val savedAt: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "scrobble_history")
+@Entity(
+    tableName = "scrobble_history",
+    indices = [
+        Index(value = ["playedAt"]),
+        Index(value = ["syncedToScrobbler", "playedAt"]),
+        Index(value = ["trackId"])
+    ]
+)
 data class ScrobbleEntity(
     @PrimaryKey(autoGenerate = true) val scrobbleId: Long = 0,
     val trackId: String,
@@ -40,7 +53,12 @@ data class ScrobbleEntity(
     val playedAt: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "user_playlists")
+@Entity(
+    tableName = "user_playlists",
+    indices = [
+        Index(value = ["updatedAt"])
+    ]
+)
 data class UserPlaylistEntity(
     @PrimaryKey val id: String,
     val name: String,
@@ -54,7 +72,10 @@ data class UserPlaylistEntity(
 
 @Entity(
     tableName = "playlist_tracks",
-    primaryKeys = ["playlistId", "trackId"]
+    primaryKeys = ["playlistId", "trackId"],
+    indices = [
+        Index(value = ["playlistId", "position", "addedAt"])
+    ]
 )
 data class PlaylistTrackEntity(
     val playlistId: String,
@@ -75,7 +96,12 @@ data class PlaylistTrackEntity(
     val addedAt: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "downloaded_tracks")
+@Entity(
+    tableName = "downloaded_tracks",
+    indices = [
+        Index(value = ["downloadedAt"])
+    ]
+)
 data class DownloadedTrackEntity(
     @PrimaryKey val id: String,
     val title: String,
@@ -102,7 +128,13 @@ data class PinnedLibraryItemEntity(
     val pinnedAt: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "recent_collections")
+@Entity(
+    tableName = "recent_collections",
+    indices = [
+        Index(value = ["playedAt"]),
+        Index(value = ["referenceId"])
+    ]
+)
 data class RecentCollectionEntity(
     @PrimaryKey val id: String,
     val title: String,
