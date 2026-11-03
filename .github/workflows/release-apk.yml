@@ -23,6 +23,11 @@ on:
         required: true
         default: true
         type: boolean
+      allow_ephemeral_signing:
+        description: "Allow temporary CI signing key if permanent RELEASE_KEYSTORE_BASE64 secret is not set"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -112,26 +117,38 @@ jobs:
           fi
 
       - name: Configure Debug & Release APK Signing
+        id: signing
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           SECRET_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          PUBLISH_RELEASE: ${{ steps.meta.outputs.publish_release }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          ALLOW_EPHEMERAL: ${{ inputs.allow_ephemeral_signing }}
         run: |
           # 1. Materialize debug.keystore from tracked debug.keystore.base64
           if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
             tr -d '[:space:]' < debug.keystore.base64 | base64 -d > debug.keystore
           fi
 
-          # 2. Configure Release keystore (uses GitHub Secrets if provided, else generates an installable PKCS12 key with alias 'upload')
+          # 2. Configure Release keystore
           KEYSTORE_FILE="${RUNNER_TEMP}/nchord-release-upload.jks"
           if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$SECRET_STORE_PASSWORD" ] && [ -n "$SECRET_KEY_PASSWORD" ]; then
-            echo "Using repository RELEASE_KEYSTORE_BASE64 secret for release signing."
+            echo "Using permanent repository RELEASE_KEYSTORE_BASE64 secret for release signing."
             printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_FILE"
+            # Validate alias 'upload' exists in the provided keystore before running Gradle
+            keytool -list -keystore "$KEYSTORE_FILE" -alias upload -storepass "$SECRET_STORE_PASSWORD" >/dev/null
             echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
             echo "STORE_PASSWORD=$SECRET_STORE_PASSWORD" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=$SECRET_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "signing_mode=PERMANENT_SECRET_KEY" >> "$GITHUB_OUTPUT"
           else
-            echo "No custom release keystore secrets configured — generating ephemeral self-signed release keystore (alias: upload)."
+            # Guard post-v1.0.0 releases so an accidental missing secret never breaks in-place user updates
+            if [ "$PUBLISH_RELEASE" = "true" ] && [ "$RELEASE_TAG" != "v1.0.0" ] && [ "$ALLOW_EPHEMERAL" != "true" ]; then
+              echo "::error::Refusing to publish upgrade release ${RELEASE_TAG} without permanent signing secrets (RELEASE_KEYSTORE_BASE64, STORE_PASSWORD, KEY_PASSWORD). Run scripts/generate-release-keystore.sh and add the 3 GitHub Secrets so users can update in-place without uninstalling!"
+              exit 1
+            fi
+            echo "::warning::Permanent signing secrets (RELEASE_KEYSTORE_BASE64, STORE_PASSWORD, KEY_PASSWORD) are not configured. Generating a one-time fallback keystore so build succeeds. Configure a permanent key via scripts/generate-release-keystore.sh so future updates install in-place!"
             EPHEMERAL_PASS="nchord-release-$(openssl rand -hex 12)"
             echo "::add-mask::$EPHEMERAL_PASS"
             keytool -genkeypair \
@@ -140,14 +157,15 @@ jobs:
               -storetype PKCS12 \
               -alias upload \
               -keyalg RSA \
-              -keysize 2048 \
+              -keysize 4096 \
               -validity 10000 \
               -storepass "$EPHEMERAL_PASS" \
               -keypass "$EPHEMERAL_PASS" \
-              -dname "CN=Nchord, OU=Mobile, O=Nchord, L=London, ST=London, C=GB"
+              -dname "CN=Nchord, OU=Android Release, O=Nchord, L=London, ST=London, C=GB"
             echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
             echo "STORE_PASSWORD=$EPHEMERAL_PASS" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=$EPHEMERAL_PASS" >> "$GITHUB_ENV"
+            echo "signing_mode=EPHEMERAL_FALLBACK_KEY" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run Android Lint & Unit/Robolectric Test Suite
@@ -156,9 +174,10 @@ jobs:
       - name: Assemble Signed Release & Debug APKs
         run: gradle :app:assembleRelease :app:assembleDebug --no-daemon
 
-      - name: Stage APKs & Generate SHA-256 Checksums
+      - name: Verify APK v2/v3 Signatures, Stage Assets & Write Checksums
         env:
           TAG: ${{ steps.meta.outputs.release_tag }}
+          SIGNING_MODE: ${{ steps.signing.outputs.signing_mode }}
         run: |
           mkdir -p dist
           RELEASE_APK=$(find app/build/outputs/apk/release -maxdepth 2 -name "*.apk" | head -n 1)
@@ -176,11 +195,29 @@ jobs:
           cp "$RELEASE_APK" "dist/Nchord-${TAG}-release.apk"
           cp "$DEBUG_APK" "dist/Nchord-${TAG}-debug.apk"
 
+          APKSIGNER_BIN="${ANDROID_HOME}/build-tools/36.0.0/apksigner"
+          CERT_INFO="$("$APKSIGNER_BIN" verify --verbose --print-certs "dist/Nchord-${TAG}-release.apk")"
+          echo "$CERT_INFO"
+
           (
             cd dist
             sha256sum "Nchord-${TAG}-release.apk" "Nchord-${TAG}-debug.apk" > SHA256SUMS.txt
             cat SHA256SUMS.txt
           )
+
+          CERT_SHA256=$(echo "$CERT_INFO" | grep "Signer #1 certificate SHA-256 digest:" | awk '{print $NF}' || true)
+          {
+            echo "## Nchord APK Build & Signing Summary (${TAG})"
+            echo "- **Signing Mode:** \`${SIGNING_MODE}\`"
+            echo "- **Release Certificate SHA-256:** \`${CERT_SHA256}\`"
+            echo "- **SHA-256 File Checksums:**"
+            echo '```text'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+            if [ "$SIGNING_MODE" != "PERMANENT_SECRET_KEY" ]; then
+              echo "> **Action Recommended:** Run \`bash scripts/generate-release-keystore.sh\` (or \`scripts/generate-release-keystore.ps1\` on Windows) and save \`RELEASE_KEYSTORE_BASE64\`, \`STORE_PASSWORD\`, and \`KEY_PASSWORD\` in **Settings → Secrets and variables → Actions** so all future updates share one permanent certificate."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK Build Artifacts
         uses: actions/upload-artifact@v4
