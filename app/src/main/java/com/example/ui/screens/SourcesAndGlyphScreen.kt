@@ -121,6 +121,10 @@ fun SourcesAndGlyphScreen(
     onToggleAutomix: (Boolean) -> Unit,
     onToggleHideUnplayable: (Boolean) -> Unit = {},
     onSelectDisplayRefreshPolicy: (DisplayRefreshPolicy) -> Unit = {},
+    onSelectPlayerTheme: (com.example.data.model.PlayerThemeMode) -> Unit = {},
+    onToggleKaraokeSing: (Boolean) -> Unit = {},
+    onToggleEndlessFlow: (Boolean) -> Unit = {},
+    onChangeAutomixCrossfade: (Int) -> Unit = {},
     isRealtimeFftActive: Boolean = false,
     onVisualizerPermissionResult: (Boolean) -> Unit = {},
     onToggleHaptics: (Boolean) -> Unit,
@@ -993,6 +997,110 @@ fun SourcesAndGlyphScreen(
                     checked = settings.automixEnabled,
                     onCheckedChange = onToggleAutomix,
                     tag = "switch_automix"
+                )
+
+                if (settings.automixEnabled) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "AUTOMIX CROSSFADE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(0, 2, 4, 6, 8, 12).forEach { sec ->
+                                val selected = settings.automixCrossfadeDurationSec == sec
+                                Box(
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (selected) MaterialTheme.colorScheme.onBackground
+                                            else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.08f)
+                                        )
+                                        .clickable { onChangeAutomixCrossfade(sec) }
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        text = if (sec == 0) "Cut" else "${sec}s",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (selected) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.onBackground
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                StudioSectionTitle(
+                    title = "PLAYER DECK THEME",
+                    subtitle = "Switch between Apple-Music Aura Glow, Retro Classipod, or Nothing Matrix"
+                )
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    com.example.data.model.PlayerThemeMode.entries.forEach { theme ->
+                        val selected = settings.playerTheme == theme
+                        FrostedGlassCapsule(
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelectPlayerTheme(theme) }
+                                .padding(1.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = theme.title,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.onBackground
+                                    )
+                                    Text(
+                                        text = theme.subtitle,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                RadioButton(
+                                    selected = selected,
+                                    onClick = { onSelectPlayerTheme(theme) },
+                                    colors = RadioButtonDefaults.colors(
+                                        selectedColor = MaterialTheme.colorScheme.onBackground
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                CleanPreferenceRow(
+                    title = "Karaoke Sing Mode",
+                    subtitle = "Attenuate lead vocals and enlarge synchronized lyrics",
+                    checked = settings.karaokeSingEnabled,
+                    onCheckedChange = onToggleKaraokeSing,
+                    tag = "switch_karaoke_sing"
+                )
+
+                CleanPreferenceRow(
+                    title = "Endless FLOW Mix Station",
+                    subtitle = "Personalized continuous mix based on skips, likes, and taste profile",
+                    checked = settings.endlessFlowEnabled,
+                    onCheckedChange = onToggleEndlessFlow,
+                    tag = "switch_endless_flow"
                 )
 
                 CleanPreferenceRow(

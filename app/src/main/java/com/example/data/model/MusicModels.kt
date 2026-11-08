@@ -293,6 +293,34 @@ enum class DisplayRefreshPolicy(
     }
 }
 
+enum class PlayerThemeMode(
+    val id: String,
+    val title: String,
+    val subtitle: String
+) {
+    AURA_GLOW(
+        id = "aura_glow",
+        title = "Aura Glow",
+        subtitle = "Auris / Apple Music style • Vibrant dynamic album art halo & frosted glass"
+    ),
+    CLASSIPOD(
+        id = "classipod",
+        title = "Classipod",
+        subtitle = "Retro iPod Classic click-wheel • Tactile haptics, CoverFlow & LCD header"
+    ),
+    NOTHING_MATRIX(
+        id = "nothing_matrix",
+        title = "Nothing Matrix",
+        subtitle = "Iconic monochrome dot-matrix vinyl platter & 6-band hardware FFT LEDs"
+    );
+
+    companion object {
+        fun fromId(raw: String?): PlayerThemeMode {
+            return entries.firstOrNull { it.id.equals(raw, ignoreCase = true) } ?: AURA_GLOW
+        }
+    }
+}
+
 @Immutable
 data class GlyphSettings(
     val onboardingCompleted: Boolean = false,
@@ -307,7 +335,11 @@ data class GlyphSettings(
     val oledDarkMode: Boolean = true,
     val glyphReactiveLeds: Boolean = true,
     val automixEnabled: Boolean = true,
+    val automixCrossfadeDurationSec: Int = 4,
     val tactileHaptics: Boolean = true,
     val hideUnplayableSongs: Boolean = false,
-    val displayRefreshPolicy: DisplayRefreshPolicy = DisplayRefreshPolicy.AUTO
+    val displayRefreshPolicy: DisplayRefreshPolicy = DisplayRefreshPolicy.AUTO,
+    val playerTheme: PlayerThemeMode = PlayerThemeMode.AURA_GLOW,
+    val karaokeSingEnabled: Boolean = false,
+    val endlessFlowEnabled: Boolean = false
 )

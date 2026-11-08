@@ -2310,7 +2310,7 @@ object FullStreamEngine {
                 candAllArtists.split(" ").containsAll(targetPrimaryArtist.split(" ").filter { it.isNotBlank() }) -> score += 75
                 candAllArtists.contains(targetPrimaryArtist) -> score += 55
                 targetPrimaryArtist.contains(candPrimaryArtist) && candPrimaryArtist.length >= 4 -> score += 25
-                else -> score -= 180 // Different artist -> almost certainly a cover or wrong song!
+                else -> score -= 1000 // Mismatched primary artist -> strictly reject covers and wrong tracks!
             }
         }
 
@@ -2318,13 +2318,13 @@ object FullStreamEngine {
         if (SOUNDALIKE_ARTIST_REGEX.containsMatchIn(candidateArtist) &&
             !SOUNDALIKE_ARTIST_REGEX.containsMatchIn(targetArtist)
         ) {
-            score -= 240
+            score -= 1200
         }
         // Penalize candidate titles that put the artist name inside "Originally Performed By X" or "X Type Beat"
-        if (Regex("""\b(type\s+beat|originally\s+by|tribute\s+to)\b""", RegexOption.IGNORE_CASE)
+        if (Regex("""\b(type\s+beat|originally\s+by|originally\s+performed\s+by|tribute\s+to|karaoke\s+version|cover\s+version)\b""", RegexOption.IGNORE_CASE)
                 .containsMatchIn("$candidateTitle $candidateAlbum")
         ) {
-            score -= 250
+            score -= 1200
         }
 
         // 3. Strict Variant / Edition Mismatch Filter (Acoustic, Cover, Live, Remix, Slowed, YT Video)
@@ -2364,8 +2364,8 @@ object FullStreamEngine {
                 diffMs <= 3_500L -> score += 45
                 diffMs <= 8_000L -> score += 22
                 diffMs <= 16_000L -> score -= 10
-                diffMs <= 32_000L -> score -= 55
-                else -> score -= 125
+                diffMs <= 25_000L -> score -= 150
+                else -> score -= 800
             }
         }
 

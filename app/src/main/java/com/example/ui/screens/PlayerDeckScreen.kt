@@ -49,16 +49,23 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.FavoriteBorder
+import com.example.data.model.PlayerThemeMode
+import kotlin.math.atan2
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -558,6 +565,9 @@ fun FullScreenNothingPlayer(
     unplayableTrackIds: Set<String> = emptySet(),
     hideUnplayableSongs: Boolean = false,
     glyphReactive: Boolean,
+    playerThemeMode: PlayerThemeMode = PlayerThemeMode.AURA_GLOW,
+    karaokeSingEnabled: Boolean = false,
+    endlessFlowEnabled: Boolean = false,
     onCollapse: () -> Unit,
     onSwipeDismiss: (() -> Unit)? = null,
     onTogglePlay: () -> Unit,
@@ -573,6 +583,9 @@ fun FullScreenNothingPlayer(
     onOpenTrackOptions: (TrackItem) -> Unit,
     onOpenArtist: (String) -> Unit,
     onChangePlaybackSpeed: (Float) -> Unit,
+    onToggleKaraokeSing: () -> Unit = {},
+    onSelectPlayerTheme: (PlayerThemeMode) -> Unit = {},
+    onStartEndlessFlow: () -> Unit = {},
     onAdjustLyricsOffset: (Long) -> Unit = {},
     onResetLyricsOffset: () -> Unit = {}
 ) {
@@ -872,21 +885,72 @@ fun FullScreenNothingPlayer(
                                 }
                             }
 
-                            FrostedGlassCapsule(
-                                shape = CircleShape,
-                                modifier = Modifier.size(48.dp)
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                IconButton(
-                                    onClick = { onOpenTrackOptions(track) },
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .testTag("full_player_more_button")
+                                FrostedGlassCapsule(
+                                    shape = CircleShape,
+                                    modifier = Modifier.size(42.dp)
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.MoreHoriz,
-                                        contentDescription = stringResource(R.string.cd_track_options),
-                                        tint = MaterialTheme.colorScheme.onBackground
-                                    )
+                                    IconButton(
+                                        onClick = onToggleKaraokeSing,
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .testTag("player_karaoke_sing_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = if (karaokeSingEnabled) Icons.Filled.Mic else Icons.Filled.MicOff,
+                                            contentDescription = "Karaoke Sing Mode",
+                                            tint = if (karaokeSingEnabled) smoothAccent else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.74f),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+
+                                FrostedGlassCapsule(
+                                    shape = CircleShape,
+                                    modifier = Modifier.size(42.dp)
+                                ) {
+                                    IconButton(
+                                        onClick = {
+                                            val nextTheme = when (playerThemeMode) {
+                                                PlayerThemeMode.AURA_GLOW -> PlayerThemeMode.CLASSIPOD
+                                                PlayerThemeMode.CLASSIPOD -> PlayerThemeMode.NOTHING_MATRIX
+                                                PlayerThemeMode.NOTHING_MATRIX -> PlayerThemeMode.AURA_GLOW
+                                            }
+                                            onSelectPlayerTheme(nextTheme)
+                                        },
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .testTag("player_theme_cycle_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Palette,
+                                            contentDescription = "Cycle Player Theme",
+                                            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.85f),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+
+                                FrostedGlassCapsule(
+                                    shape = CircleShape,
+                                    modifier = Modifier.size(42.dp)
+                                ) {
+                                    IconButton(
+                                        onClick = { onOpenTrackOptions(track) },
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .testTag("full_player_more_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.MoreHoriz,
+                                            contentDescription = stringResource(R.string.cd_track_options),
+                                            tint = MaterialTheme.colorScheme.onBackground,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -985,22 +1049,48 @@ fun FullScreenNothingPlayer(
                                 }
 
                                 1 -> {
-                                    // Center Artwork Platter Stage (decoupled from 22Hz FFT ticks -> 0 recompositions while spinning at 144Hz)
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .then(onVerticalPullGesture),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        GlyphVinylTurntable(
-                                            artworkUrl = track.artworkUrl,
-                                            isPlaying = audioState.isPlaying,
-                                            glyphReactive = glyphReactive,
-                                            modifier = Modifier
-                                                .fillMaxSize(0.86f)
-                                                .sizeIn(maxWidth = 306.dp, maxHeight = 306.dp)
-                                                .aspectRatio(1f)
-                                        )
+                                    when (playerThemeMode) {
+                                        PlayerThemeMode.CLASSIPOD -> {
+                                            ClassipodPlayerStage(
+                                                track = track,
+                                                audioState = audioState,
+                                                accentColor = smoothAccent,
+                                                onTogglePlay = onTogglePlay,
+                                                onSkipPrev = onSkipPrev,
+                                                onSkipNext = onSkipNext,
+                                                onSeekMs = onSeekMs,
+                                                onCollapse = onCollapse,
+                                                modifier = Modifier.then(onVerticalPullGesture)
+                                            )
+                                        }
+                                        PlayerThemeMode.AURA_GLOW -> {
+                                            AuraGlowArtworkStage(
+                                                track = track,
+                                                isPlaying = audioState.isPlaying,
+                                                accentColor = smoothAccent,
+                                                karaokeSingEnabled = karaokeSingEnabled,
+                                                modifier = Modifier.then(onVerticalPullGesture)
+                                            )
+                                        }
+                                        else -> {
+                                            // Center Nothing Matrix Dot-Matrix Vinyl Turntable
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .then(onVerticalPullGesture),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                GlyphVinylTurntable(
+                                                    artworkUrl = track.artworkUrl,
+                                                    isPlaying = audioState.isPlaying,
+                                                    glyphReactive = glyphReactive,
+                                                    modifier = Modifier
+                                                        .fillMaxSize(0.86f)
+                                                        .sizeIn(maxWidth = 306.dp, maxHeight = 306.dp)
+                                                        .aspectRatio(1f)
+                                                )
+                                            }
+                                        }
                                     }
                                 }
 
@@ -2055,4 +2145,326 @@ private suspend fun extractVibrantArtworkAccent(
             Color(red = bestR, green = bestG, blue = bestB, alpha = 1f)
         }
     }.getOrNull()
+}
+
+@Composable
+private fun AuraGlowArtworkStage(
+    track: TrackItem,
+    isPlaying: Boolean,
+    accentColor: Color,
+    karaokeSingEnabled: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        val glowScale by animateFloatAsState(
+            targetValue = if (isPlaying) 1.05f else 0.98f,
+            animationSpec = spring(stiffness = Spring.StiffnessLow),
+            label = "aura_glow_scale"
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxSize(0.88f)
+                .scale(glowScale)
+                .drawWithCache {
+                    val brush = Brush.radialGradient(
+                        colors = listOf(
+                            accentColor.copy(alpha = 0.45f),
+                            accentColor.copy(alpha = 0.15f),
+                            Color.Transparent
+                        ),
+                        center = Offset(size.width / 2f, size.height / 2f),
+                        radius = size.width * 0.55f
+                    )
+                    onDrawBehind {
+                        drawRect(brush)
+                    }
+                }
+        )
+
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            if (karaokeSingEnabled) {
+                FrostedGlassCapsule(
+                    shape = CircleShape,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Mic,
+                            contentDescription = null,
+                            tint = accentColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "SING MODE • VOCAL ATTENUATED",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            Surface(
+                shape = RoundedCornerShape(26.dp),
+                tonalElevation = 8.dp,
+                shadowElevation = 18.dp,
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier
+                    .fillMaxSize(0.84f)
+                    .sizeIn(maxWidth = 310.dp, maxHeight = 310.dp)
+                    .aspectRatio(1f)
+                    .clip(RoundedCornerShape(26.dp))
+                    .testTag("aura_glow_artwork_card")
+            ) {
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(track.artworkUrl.ifBlank { R.drawable.ic_vinyl_icon_src })
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = stringResource(R.string.cd_album_art),
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ClassipodPlayerStage(
+    track: TrackItem,
+    audioState: AudioEngineState,
+    accentColor: Color,
+    onTogglePlay: () -> Unit,
+    onSkipPrev: () -> Unit,
+    onSkipNext: () -> Unit,
+    onSeekMs: (Long) -> Unit,
+    onCollapse: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        // Retro iPod LCD Header Display Screen
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = Color(0xFF101418),
+            border = androidx.compose.foundation.BorderStroke(1.5.dp, Color(0xFF2C3440)),
+            shadowElevation = 6.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp)
+                .testTag("classipod_lcd_screen")
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // LCD Status Bar
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Now Playing",
+                        style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFontFamily),
+                        color = Color(0xFF8FA3BF)
+                    )
+                    Text(
+                        text = "${audioState.streamTelemetry.codecLabel} • ${audioState.streamTelemetry.bitrateKbps}k",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                        color = Color(0xFF38BDF8)
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.size(90.dp)
+                    ) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(track.artworkUrl.ifBlank { R.drawable.ic_vinyl_icon_src })
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = track.title,
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontFamily = MonoFontFamily,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            color = Color(0xFFF1F5F9),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = track.artist,
+                            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = MonoFontFamily),
+                            color = Color(0xFF94A3B8),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = track.album,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                            color = Color(0xFF64748B),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                // Retro LCD Scrubber Bar
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    val progress = if (audioState.durationMs > 0) {
+                        (audioState.currentPositionMs.toFloat() / audioState.durationMs.toFloat()).coerceIn(0f, 1f)
+                    } else 0f
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(CircleShape),
+                        color = Color(0xFF38BDF8),
+                        trackColor = Color(0xFF1E293B)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = formatTimeCode(audioState.currentPositionMs),
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                            color = Color(0xFF94A3B8)
+                        )
+                        Text(
+                            text = formatTimeCode(audioState.durationMs),
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                            color = Color(0xFF94A3B8)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Classipod Retro Click-Wheel
+        Box(
+            modifier = Modifier
+                .size(240.dp)
+                .clip(CircleShape)
+                .background(Color(0xFF1E2026))
+                .border(2.dp, Color(0xFF323642), CircleShape)
+                .pointerInput(audioState.durationMs, audioState.currentPositionMs) {
+                    detectHorizontalDragGestures { change, dragAmount ->
+                        change.consume()
+                        val stepMs = (dragAmount * 800L).toLong()
+                        val target = (audioState.currentPositionMs + stepMs).coerceIn(0L, audioState.durationMs)
+                        onSeekMs(target)
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    }
+                }
+                .testTag("classipod_click_wheel"),
+            contentAlignment = Alignment.Center
+        ) {
+            // Top: MENU
+            Text(
+                text = "MENU",
+                style = MaterialTheme.typography.labelLarge.copy(fontFamily = MonoFontFamily, fontWeight = FontWeight.Bold),
+                color = Color(0xFFE2E8F0),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 18.dp)
+                    .clickable { onCollapse() }
+            )
+            // Left: Previous
+            IconButton(
+                onClick = onSkipPrev,
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 14.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.SkipPrevious,
+                    contentDescription = "Previous",
+                    tint = Color(0xFFE2E8F0)
+                )
+            }
+            // Right: Next
+            IconButton(
+                onClick = onSkipNext,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 14.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.SkipNext,
+                    contentDescription = "Next",
+                    tint = Color(0xFFE2E8F0)
+                )
+            }
+            // Bottom: Play/Pause
+            IconButton(
+                onClick = onTogglePlay,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 14.dp)
+            ) {
+                Icon(
+                    imageVector = if (audioState.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    contentDescription = "Play or Pause",
+                    tint = Color(0xFFE2E8F0)
+                )
+            }
+
+            // Center Select Button
+            Box(
+                modifier = Modifier
+                    .size(76.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFF2D313D))
+                    .border(1.5.dp, Color(0xFF474D5E), CircleShape)
+                    .clickable(onClick = onTogglePlay),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = if (audioState.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    contentDescription = null,
+                    tint = Color(0xFFF8FAFC),
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+        }
+    }
 }

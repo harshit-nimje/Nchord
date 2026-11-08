@@ -1588,6 +1588,10 @@ class NothingMusicRepository(
     suspend fun setOledDarkMode(enabled: Boolean) = prefsStore.setOledDarkMode(enabled)
     suspend fun setGlyphReactive(enabled: Boolean) = prefsStore.setGlyphReactive(enabled)
     suspend fun setAutomixEnabled(enabled: Boolean) = prefsStore.setAutomixEnabled(enabled)
+    suspend fun setAutomixCrossfadeDuration(sec: Int) = prefsStore.setAutomixCrossfadeDuration(sec)
+    suspend fun setPlayerTheme(theme: com.example.data.model.PlayerThemeMode) = prefsStore.setPlayerTheme(theme)
+    suspend fun setKaraokeSingEnabled(enabled: Boolean) = prefsStore.setKaraokeSingEnabled(enabled)
+    suspend fun setEndlessFlowEnabled(enabled: Boolean) = prefsStore.setEndlessFlowEnabled(enabled)
     suspend fun setTactileHaptics(enabled: Boolean) = prefsStore.setTactileHaptics(enabled)
     suspend fun setHideUnplayableSongs(enabled: Boolean) = prefsStore.setHideUnplayableSongs(enabled)
     suspend fun setDisplayRefreshPolicy(policy: com.example.data.model.DisplayRefreshPolicy) =

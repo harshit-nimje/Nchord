@@ -726,6 +726,10 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                             onToggleAutomix = { viewModel.setAutomixEnabled(it) },
                             onToggleHideUnplayable = { viewModel.setHideUnplayableSongs(it) },
                             onSelectDisplayRefreshPolicy = { viewModel.setDisplayRefreshPolicy(it) },
+                            onSelectPlayerTheme = { viewModel.setPlayerTheme(it) },
+                            onToggleKaraokeSing = { viewModel.setKaraokeSingEnabled(it) },
+                            onToggleEndlessFlow = { viewModel.setEndlessFlowEnabled(it) },
+                            onChangeAutomixCrossfade = { viewModel.setAutomixCrossfadeDuration(it) },
                             isRealtimeFftActive = bannerAudioState.isRealtimeFftActive,
                             onVisualizerPermissionResult = { viewModel.onVisualizerPermissionResult(it) },
                             onToggleHaptics = { viewModel.setTactileHaptics(it) },
@@ -772,6 +776,12 @@ fun NothingChordApp(viewModel: NothingChordViewModel) {
                 unplayableTrackIds = unplayableTrackIds,
                 hideUnplayableSongs = glyphSettings.hideUnplayableSongs,
                 glyphReactive = glyphSettings.glyphReactiveLeds,
+                playerThemeMode = glyphSettings.playerTheme,
+                karaokeSingEnabled = glyphSettings.karaokeSingEnabled,
+                endlessFlowEnabled = glyphSettings.endlessFlowEnabled,
+                onToggleKaraokeSing = { viewModel.setKaraokeSingEnabled(!glyphSettings.karaokeSingEnabled) },
+                onSelectPlayerTheme = { viewModel.setPlayerTheme(it) },
+                onStartEndlessFlow = { viewModel.startEndlessFlowStation() },
                 onCollapse = {
                     playerDismissedBySwipe = false
                     viewModel.setFullPlayerOpen(false)

@@ -33,9 +33,13 @@ class NothingPreferencesStore(private val context: Context) {
         val OLED_DARK_MODE = booleanPreferencesKey("oled_dark_mode")
         val GLYPH_REACTIVE = booleanPreferencesKey("glyph_reactive_leds")
         val AUTOMIX_ENABLED = booleanPreferencesKey("automix_enabled")
+        val AUTOMIX_CROSSFADE_SEC = androidx.datastore.preferences.core.intPreferencesKey("automix_crossfade_sec")
         val TACTILE_HAPTICS = booleanPreferencesKey("tactile_haptics")
         val HIDE_UNPLAYABLE_SONGS = booleanPreferencesKey("hide_unplayable_songs")
         val DISPLAY_REFRESH_POLICY = stringPreferencesKey("display_refresh_policy")
+        val PLAYER_THEME = stringPreferencesKey("player_theme_mode")
+        val KARAOKE_SING_ENABLED = booleanPreferencesKey("karaoke_sing_enabled")
+        val ENDLESS_FLOW_ENABLED = booleanPreferencesKey("endless_flow_enabled")
         val UNPLAYABLE_TRACK_IDS = stringPreferencesKey("unplayable_track_ids_csv")
         val HIDDEN_HOME_PLAYLIST_KEYS = stringPreferencesKey("hidden_home_playlist_keys_csv")
 
@@ -86,9 +90,13 @@ class NothingPreferencesStore(private val context: Context) {
             oledDarkMode = prefs[Keys.OLED_DARK_MODE] ?: true,
             glyphReactiveLeds = prefs[Keys.GLYPH_REACTIVE] ?: true,
             automixEnabled = prefs[Keys.AUTOMIX_ENABLED] ?: true,
+            automixCrossfadeDurationSec = (prefs[Keys.AUTOMIX_CROSSFADE_SEC] ?: 4).coerceIn(0, 12),
             tactileHaptics = prefs[Keys.TACTILE_HAPTICS] ?: true,
             hideUnplayableSongs = prefs[Keys.HIDE_UNPLAYABLE_SONGS] ?: false,
-            displayRefreshPolicy = DisplayRefreshPolicy.fromId(prefs[Keys.DISPLAY_REFRESH_POLICY])
+            displayRefreshPolicy = DisplayRefreshPolicy.fromId(prefs[Keys.DISPLAY_REFRESH_POLICY]),
+            playerTheme = com.example.data.model.PlayerThemeMode.fromId(prefs[Keys.PLAYER_THEME]),
+            karaokeSingEnabled = prefs[Keys.KARAOKE_SING_ENABLED] ?: false,
+            endlessFlowEnabled = prefs[Keys.ENDLESS_FLOW_ENABLED] ?: false
         )
     }
 
@@ -167,6 +175,22 @@ class NothingPreferencesStore(private val context: Context) {
 
     suspend fun setAutomixEnabled(enabled: Boolean) {
         context.nothingDataStore.edit { it[Keys.AUTOMIX_ENABLED] = enabled }
+    }
+
+    suspend fun setAutomixCrossfadeDuration(sec: Int) {
+        context.nothingDataStore.edit { it[Keys.AUTOMIX_CROSSFADE_SEC] = sec.coerceIn(0, 12) }
+    }
+
+    suspend fun setPlayerTheme(theme: com.example.data.model.PlayerThemeMode) {
+        context.nothingDataStore.edit { it[Keys.PLAYER_THEME] = theme.id }
+    }
+
+    suspend fun setKaraokeSingEnabled(enabled: Boolean) {
+        context.nothingDataStore.edit { it[Keys.KARAOKE_SING_ENABLED] = enabled }
+    }
+
+    suspend fun setEndlessFlowEnabled(enabled: Boolean) {
+        context.nothingDataStore.edit { it[Keys.ENDLESS_FLOW_ENABLED] = enabled }
     }
 
     suspend fun setTactileHaptics(enabled: Boolean) {

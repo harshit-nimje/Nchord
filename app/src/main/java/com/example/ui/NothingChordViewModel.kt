@@ -2815,6 +2815,55 @@ class NothingChordViewModel(
         viewModelScope.launch { repository.setDisplayRefreshPolicy(policy) }
     }
 
+    fun setPlayerTheme(theme: com.example.data.model.PlayerThemeMode) {
+        triggerHaptic()
+        emitFeedback("Theme • ${theme.title}")
+        viewModelScope.launch { repository.setPlayerTheme(theme) }
+    }
+
+    fun setKaraokeSingEnabled(enabled: Boolean) {
+        triggerHaptic()
+        emitFeedback(if (enabled) "Sing Mode On • Lead Vocals Reduced" else "Sing Mode Off")
+        viewModelScope.launch { repository.setKaraokeSingEnabled(enabled) }
+    }
+
+    fun setEndlessFlowEnabled(enabled: Boolean) {
+        triggerHaptic()
+        emitFeedback(if (enabled) "Endless FLOW Station On" else "FLOW Off")
+        viewModelScope.launch { repository.setEndlessFlowEnabled(enabled) }
+    }
+
+    fun setAutomixCrossfadeDuration(sec: Int) {
+        triggerHaptic()
+        emitFeedback("Crossfade • ${sec}s")
+        viewModelScope.launch { repository.setAutomixCrossfadeDuration(sec) }
+    }
+
+    fun startEndlessFlowStation() {
+        triggerConfirmHaptic()
+        emitFeedback("FLOW Mix • Generating station")
+        viewModelScope.launch {
+            repository.setEndlessFlowEnabled(true)
+            val profile = userTasteProfile.value
+            val leadSeed = profile.topAffinityArtists.firstOrNull() ?: "Daft Punk"
+            val secondSeed = profile.topAffinityArtists.getOrNull(1) ?: "The Weeknd"
+            val res1 = repository.searchStreamingCatalog(leadSeed, limit = 12).getOrDefault(emptyList())
+            val res2 = repository.searchStreamingCatalog(secondSeed, limit = 8).getOrDefault(emptyList())
+            val pool = (res1 + res2).distinctBy { it.id }
+            val ranked = com.example.domain.TasteAndSearchRankingEngine.rankDiscoveryTracks(
+                tracks = pool,
+                profile = profile,
+                unplayableIds = unplayableTrackIds.value
+            )
+            if (ranked.isNotEmpty()) {
+                playTrackFromContext(ranked.first(), ranked, silentFeedback = true)
+                emitFeedback("FLOW Mix • Station Live")
+            } else {
+                emitFeedback("Unable to launch FLOW mix")
+            }
+        }
+    }
+
     fun onVisualizerPermissionResult(granted: Boolean) {
         triggerHaptic()
         if (granted) {
